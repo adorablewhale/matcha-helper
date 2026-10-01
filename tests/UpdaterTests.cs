@@ -17,9 +17,11 @@ static class Program {
         string source=args[0], release=Path.Combine(source,"release");
         var manifest=File.ReadAllBytes(Path.Combine(release,"update.json"));var sig=File.ReadAllBytes(Path.Combine(release,"update.sig"));
         string key=File.ReadAllText(Path.Combine(source,"update-public-key.xml"));var current=new Version(1,1,1,0);
-        var valid=HelperUpdater.Verify(manifest,sig,key,current);Check(valid.version=="1.2.0","Valid signed update");
-        Check(HelperUpdater.Verify(manifest,sig,key,new Version(1,2,0,0))==null,"Already current");
-        Check(HelperUpdater.Verify(manifest,sig,key,new Version(9,0,0,0))==null,"No downgrade");
+        var valid=HelperUpdater.Verify(manifest,sig,key,current);
+        var expected=HelperUpdater.Normalize(System.Diagnostics.FileVersionInfo.GetVersionInfo(Path.Combine(source,"package","matcha-helper.exe")).FileVersion);
+        Check(HelperUpdater.Normalize(valid.version)==expected,"Valid signed update matches built helper");
+        Check(HelperUpdater.Verify(manifest,sig,key,expected)==null,"Already current");
+        Check(HelperUpdater.Verify(manifest,sig,key,new Version(expected.Major+1,0,0,0))==null,"No downgrade");
         var changed=(byte[])manifest.Clone();changed[changed.Length-2]^=1;Denied(()=>HelperUpdater.Verify(changed,sig,key,current),"modified manifest");
         var badSig=Encoding.UTF8.GetBytes(Convert.ToBase64String(new byte[384]));Denied(()=>HelperUpdater.Verify(manifest,badSig,key,current),"bad signature");
         using(var rsa=new RSACryptoServiceProvider(2048)) {
@@ -35,8 +37,8 @@ static class Program {
         foreach(var names in new[] {new[]{"../escape.exe"},new[]{"matcha-helper.exe","matcha-helper.exe"},new[]{"install.ps1"},new[]{"evil.exe"}}) {
             var zip=Zip(names);Denied(()=>HelperUpdater.ValidatePackage(ForZip(zip),zip),"unsafe/incomplete/duplicate ZIP");
         }
-        string prefix="https://github.com/adorablewhale/matcha-helper/releases/download/v1.2.0/";
-        var metadata=new ReleaseInfo {tag_name="v1.2.0",assets=new[]{new ReleaseAsset {name="update.json",browser_download_url=prefix+"update.json"},new ReleaseAsset {name="update.sig",browser_download_url=prefix+"update.sig"},new ReleaseAsset {name="matcha-helper.zip",browser_download_url=prefix+"matcha-helper.zip"}}};
+        string prefix="https://github.com/adorablewhale/matcha-helper/releases/download/v"+valid.version+"/";
+        var metadata=new ReleaseInfo {tag_name="v"+valid.version,assets=new[]{new ReleaseAsset {name="update.json",browser_download_url=prefix+"update.json"},new ReleaseAsset {name="update.sig",browser_download_url=prefix+"update.sig"},new ReleaseAsset {name="matcha-helper.zip",browser_download_url=prefix+"matcha-helper.zip"}}};
         var serializer=new JavaScriptSerializer();Func<string,int,byte[]> fetch=(url,max)=>url.EndsWith("update.json")?manifest:sig;
         var candidate=HelperUpdater.Check(Encoding.UTF8.GetBytes(serializer.Serialize(metadata)),current,key,fetch);Check(candidate!=null,"Complete release");
         metadata.prerelease=true;Denied(()=>HelperUpdater.Check(Encoding.UTF8.GetBytes(serializer.Serialize(metadata)),current,key,fetch),"prerelease");metadata.prerelease=false;
