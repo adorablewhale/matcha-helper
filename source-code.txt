@@ -1,0 +1,1384 @@
+MATCHA HELPER 1.2.0 - COMPLETE SOURCE
+
+===== MatchaHelper.cs =====
+// Matcha helper 1.2.0. Readable native host with signed, idle-only GitHub updates.
+// No obfuscation, elevation or telemetry. Update verification is in Updater.cs.
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Web.Script.Serialization;
+using System.Windows.Forms;
+[assembly: AssemblyTitle("Matcha helper")]
+[assembly: AssemblyDescription("Optional local Windows features for Matcha scripts")]
+[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyFileVersion("1.2.0.0")]
+
+static class Program {
+    internal static readonly string Root = Path.Combine(KnownFolder("F1B32785-6FBA-4FCF-9D55-7B8E7F157091"), "matcha-helper");
+    internal static readonly string Exe = Path.Combine(Root, "matcha-helper.exe");
+    internal static readonly string Sid = WindowsIdentity.GetCurrent().User.Value;
+    internal static string PS { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell\\v1.0\\powershell.exe"); } }
+    [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
+    [DllImport("shell32.dll")] static extern int SHGetKnownFolderPath(ref Guid id, uint flags, IntPtr token, out IntPtr path);
+    internal static string KnownFolder(string guid) {
+        var id = new Guid(guid); IntPtr pointer;
+        int hr = SHGetKnownFolderPath(ref id, 0x00010000, IntPtr.Zero, out pointer);
+        if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+        try { return Marshal.PtrToStringUni(pointer); } finally { Marshal.FreeCoTaskMem(pointer); }
+    }
+    [STAThread] static void Main(string[] args) {
+        SetProcessDPIAware(); Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
+        try {
+            if (Array.IndexOf(args, "--quit") >= 0) { Signal("Exit"); return; }
+            bool created;
+            using (var singleton = new Mutex(true, "Local\\MatchaHelper-" + Sid, out created)) {
+                if (!created) { if (Array.IndexOf(args, "--tray") < 0) Signal("Open"); return; }
+                try { Application.Run(new HelperWindow(args)); } finally { singleton.ReleaseMutex(); }
+            }
+        } catch (Exception e) { MessageBox.Show(e.Message, "Matcha helper", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+    }
+    static void Signal(string name) { try { using (var ev = EventWaitHandle.OpenExisting("Local\\MatchaHelper" + name + "-" + Sid)) ev.Set(); } catch (WaitHandleCannotBeOpenedException) {} }
+    internal static void CheckPath(string path) {
+        string full = Path.GetFullPath(path);
+        if (!full.Equals(Root, StringComparison.OrdinalIgnoreCase) && !full.StartsWith(Root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) throw new IOException("Path is outside the helper installation.");
+        for (string p = full; !String.IsNullOrEmpty(p); p = Path.GetDirectoryName(p))
+            if ((Directory.Exists(p) || File.Exists(p)) && (File.GetAttributes(p) & FileAttributes.ReparsePoint) != 0) throw new IOException("Linked installation folders are not supported.");
+    }
+    internal static string Resource(string name) { using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(name)) using (var reader = new StreamReader(stream)) return reader.ReadToEnd(); }
+    internal static void Write(string path, string content) { CheckPath(path); File.WriteAllText(path, content, new System.Text.UTF8Encoding(false)); }
+    internal static string Shortcut { get { return Path.Combine(KnownFolder("B97D20BB-F46A-4C97-BA10-5E3608430854"), "Matcha helper.lnk"); } }
+    internal static object Property(object obj, string name, object value) { return obj.GetType().InvokeMember(name, BindingFlags.SetProperty, null, obj, new object[] {value}); }
+    internal static void Startup(bool enabled) {
+        if (!enabled) {
+            if (File.Exists(Shortcut)) {
+                object shell = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell"));
+                object shortcut = shell.GetType().InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, shell, new object[] {Shortcut});
+                string target = (string)shortcut.GetType().InvokeMember("TargetPath", BindingFlags.GetProperty, null, shortcut, null);
+                Marshal.FinalReleaseComObject(shortcut); Marshal.FinalReleaseComObject(shell);
+                if (!target.Equals(Exe, StringComparison.OrdinalIgnoreCase)) throw new IOException("The startup shortcut belongs to another program.");
+                Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(Shortcut, Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs, Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
+            }
+            return;
+        }
+        object ws = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell"));
+        object link = ws.GetType().InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, ws, new object[] {Shortcut});
+        Property(link, "TargetPath", Exe); Property(link, "Arguments", "--tray"); Property(link, "WorkingDirectory", Root);
+        Property(link, "IconLocation", Exe + ",0"); Property(link, "Description", "Matcha helper — sleeps until a script is active; quit from the tray.");
+        link.GetType().InvokeMember("Save", BindingFlags.InvokeMethod, null, link, null);
+        Marshal.FinalReleaseComObject(link); Marshal.FinalReleaseComObject(ws);
+    }
+}
+
+sealed class HelperWindow : Form {
+    readonly Color Ink = Color.FromArgb(235, 239, 236), Muted = Color.FromArgb(137, 148, 143), Mint = Color.FromArgb(160, 225, 193);
+    readonly JavaScriptSerializer json = new JavaScriptSerializer();
+    readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
+    readonly EventWaitHandle openEvent = new EventWaitHandle(false, EventResetMode.AutoReset, "Local\\MatchaHelperOpen-" + Program.Sid);
+    readonly EventWaitHandle exitEvent = new EventWaitHandle(false, EventResetMode.AutoReset, "Local\\MatchaHelperExit-" + Program.Sid);
+    NotifyIcon tray; Process backend; bool exiting, paused, installed, initializing = true, startHidden;
+    string workspace = "C:\\matcha\\workspace", mode = "sleeping";
+    Label heading, detail, scripts, pathLabel, updateLabel; Button pauseButton, installButton; CheckBox startup, updates;
+    DateTime nextCheck = DateTime.UtcNow.AddSeconds(10); bool checking, applying, requestedUpdate;
+    string pendingStage;
+    readonly string runtime = Path.Combine(Program.Root, "runtime");
+    public HelperWindow(string[] args) {
+        Text = "matcha helper"; BackColor = Color.FromArgb(14, 18, 16); ForeColor = Ink;
+        Font = new Font("Segoe UI", 10); ClientSize = new Size(520, 656); MinimumSize = MaximumSize = Size;
+        FormBorderStyle = FormBorderStyle.FixedSingle; MaximizeBox = false; StartPosition = FormStartPosition.CenterScreen;
+        Icon = MakeIcon(); installed = Application.ExecutablePath.Equals(Program.Exe, StringComparison.OrdinalIgnoreCase);
+        startHidden = Array.IndexOf(args, "--tray") >= 0;
+        Program.CheckPath(runtime); Directory.CreateDirectory(runtime);
+        if (File.Exists(Path.Combine(Program.Root, "workspace.txt"))) workspace = File.ReadAllText(Path.Combine(Program.Root, "workspace.txt")).Trim();
+        int wi = Array.IndexOf(args, "--workspace"); if (wi >= 0 && wi + 1 < args.Length) workspace = Path.GetFullPath(args[wi+1]);
+        Program.Write(Path.Combine(runtime, "backend.ps1"), Program.Resource("Backend"));
+        Program.Write(Path.Combine(runtime, "source-code.txt"), Program.Resource("Source"));
+        BuildUI(); BuildTray();
+        timer.Interval = 1000; timer.Tick += delegate { RefreshStatus(); }; timer.Start();
+        FormClosing += delegate(object sender, FormClosingEventArgs e) {
+            if (!exiting && e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); }
+        };
+        Shown += delegate { if (startHidden) Hide(); };
+        if (installed || Array.IndexOf(args, "--portable") >= 0) StartBackend();
+        else { heading.Text = "ready when you are"; detail.Text = "install once, or run just for this session."; scripts.Text = "your scripts keep working without the helper."; }
+        initializing = false;
+    }
+    Label LabelAt(string text, int x, int y, int w, int h, float size, Color color) {
+        var l = new Label {Text = text, Location = new Point(x,y), Size = new Size(w,h), Font = new Font("Segoe UI",size), ForeColor = color, BackColor = Color.Transparent}; Controls.Add(l); return l;
+    }
+    Button ButtonAt(string text, int x, int y, int w, EventHandler action, bool primary) {
+        var b = new Button {Text = text, Location = new Point(x,y), Size = new Size(w,38), FlatStyle = FlatStyle.Flat, BackColor = primary ? Mint : Color.FromArgb(23,29,26), ForeColor = primary ? Color.FromArgb(14,24,18) : Ink, Cursor = Cursors.Hand};
+        b.FlatAppearance.BorderColor = Color.FromArgb(53,65,58); b.FlatAppearance.BorderSize = primary ? 0 : 1;
+        b.Click += action; Controls.Add(b); return b;
+    }
+    void BuildUI() {
+        LabelAt("adorablewhale / windows",28,25,440,22,9,Muted);
+        LabelAt("matcha helper",28,56,440,46,25,Ink);
+        LabelAt("a quiet companion for your scripts.",30,109,440,24,10,Muted);
+        heading = LabelAt("starting…",52,173,410,40,23,Mint);
+        detail = LabelAt("checking the local connection",52,225,410,40,10,Ink);
+        scripts = LabelAt("",52,271,410,36,9,Muted);
+        LabelAt("LOCAL WORKSPACE",30,336,440,20,8,Muted);
+        pathLabel = LabelAt(workspace,30,364,354,36,9,Ink);
+        ButtonAt("change",392,355,98,ChooseWorkspace,false);
+        startup = new CheckBox {Text = "start in the tray when i sign in", Location = new Point(30,411), Size = new Size(390,28), ForeColor = Ink, Checked = installed && File.Exists(Program.Shortcut), Visible = installed};
+        startup.CheckedChanged += delegate { if (!initializing) try { Program.Startup(startup.Checked); } catch (Exception e) { Error(e); } }; Controls.Add(startup);
+        if (!installed) LabelAt("install for this windows user · start in the tray at login",30,411,460,28,9,Muted);
+        if (installed) pauseButton = ButtonAt("pause helper",30,459,148,TogglePause,false);
+        else {
+            installButton = ButtonAt("install and start",30,459,174,Install,true);
+            pauseButton = ButtonAt("run once",214,459,124,delegate { if (backend == null) StartBackend(); else TogglePause(null,EventArgs.Empty); },false);
+        }
+        ButtonAt("view source",installed ? 188 : 348,459,installed ? 142 : 142,delegate { OpenSource(); },false);
+        if (installed) ButtonAt("quit",340,459,150,delegate { Quit(); },false);
+        LabelAt("closing this window keeps the helper in your tray.\nright-click its whale icon to pause or quit.",30,515,460,36,9,Muted);
+        updates = new CheckBox {Text = "automatically update from signed GitHub releases", Location = new Point(30,560), Size = new Size(460,28), Checked = !File.Exists(Path.Combine(Program.Root,"updates-disabled.txt")), Visible = installed};
+        updates.CheckedChanged += delegate { if (!initializing) { Program.Write(Path.Combine(Program.Root,"updates-disabled.txt"),updates.Checked ? "enabled" : "disabled"); if (updates.Checked) nextCheck = DateTime.UtcNow; } }; Controls.Add(updates);
+        if (File.Exists(Path.Combine(Program.Root,"updates-disabled.txt"))) updates.Checked = File.ReadAllText(Path.Combine(Program.Root,"updates-disabled.txt")).Trim() != "disabled";
+        updateLabel = LabelAt("v1.2.0 · updates apply only while sleeping",30,600,330,35,9,Muted);
+        if (installed) ButtonAt("check updates",366,599,124,delegate { CheckUpdates(true); },false);
+    }
+    protected override void OnPaint(PaintEventArgs e) {
+        base.OnPaint(e); e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        using (var b = new SolidBrush(Color.FromArgb(22,29,25))) e.Graphics.FillRectangle(b,30,154,460,160);
+        using (var pen = new Pen(Color.FromArgb(48,65,55))) e.Graphics.DrawRectangle(pen,30,154,459,159);
+        using (var pen = new Pen(Color.FromArgb(44,54,48))) e.Graphics.DrawLine(pen,30,321,490,321);
+    }
+    void BuildTray() {
+        var menu = new ContextMenuStrip {BackColor = Color.FromArgb(23,29,26), ForeColor = Ink, ShowImageMargin = false};
+        menu.Items.Add("open helper",null,delegate { Reveal(); });
+        menu.Items.Add("pause / resume",null,TogglePause);
+        menu.Items.Add("open dashboard",null,delegate { Process.Start("https://adorablewhale.world/dashboard"); });
+        menu.Items.Add("view source",null,delegate { OpenSource(); });
+        if (installed) menu.Items.Add("check for updates",null,delegate { CheckUpdates(true); });
+        menu.Items.Add(new ToolStripSeparator());
+        if (installed) menu.Items.Add("uninstall helper",null,Uninstall);
+        menu.Items.Add("quit helper",null,delegate { Quit(); });
+        tray = new NotifyIcon {Icon = Icon, Text = "matcha helper — sleeping", ContextMenuStrip = menu, Visible = true};
+        tray.DoubleClick += delegate { Reveal(); };
+    }
+    void Reveal() { Show(); WindowState = FormWindowState.Normal; Activate(); }
+    void Error(Exception e) { MessageBox.Show(this,e.Message,"Matcha helper",MessageBoxButtons.OK,MessageBoxIcon.Error); }
+    void ChooseWorkspace(object sender, EventArgs e) {
+        using (var dialog = new FolderBrowserDialog {Description = "choose your Matcha workspace", SelectedPath = workspace}) {
+            if (dialog.ShowDialog(this) != DialogResult.OK) return;
+            workspace = Path.GetFullPath(dialog.SelectedPath); pathLabel.Text = workspace;
+            Program.Write(Path.Combine(Program.Root,"workspace.txt"),workspace);
+            if (backend != null) { StopBackend(); StartBackend(); }
+        }
+    }
+    void StartBackend() {
+        if (!Directory.Exists(workspace)) { heading.Text = "choose your workspace"; detail.Text = "select the folder Matcha uses for its script files."; return; }
+        try {
+            var info = new ProcessStartInfo(Program.PS,"-STA -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \"" + Path.Combine(runtime,"backend.ps1") + "\"") {UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true, WorkingDirectory = runtime};
+            info.EnvironmentVariables["FH_ARG"] = workspace;
+            info.EnvironmentVariables["MATCHA_HELPER_NO_BROWSER"] = "1";
+            info.EnvironmentVariables["MATCHA_HELPER_HOST_PID"] = Process.GetCurrentProcess().Id.ToString();
+            info.EnvironmentVariables["MATCHA_HELPER_HOST_CREATED"] = Process.GetCurrentProcess().StartTime.ToUniversalTime().Ticks.ToString();
+            backend = Process.Start(info);
+            // Consume output without logging request data, tokens or file contents.
+            backend.OutputDataReceived += delegate {}; backend.ErrorDataReceived += delegate {};
+            backend.BeginOutputReadLine(); backend.BeginErrorReadLine();
+            paused = false; pauseButton.Text = "pause helper";
+            Program.Write(Path.Combine(Program.Root,"process.json"), json.Serialize(new {pid = Process.GetCurrentProcess().Id, created = Process.GetCurrentProcess().StartTime.ToUniversalTime().Ticks, backend = backend.Id, workspace = workspace}));
+            heading.Text = "connecting…"; detail.Text = "the local helper is starting.";
+        } catch (Exception e) { Error(e); }
+    }
+    void StopBackend() {
+        if (backend == null) return;
+        int own = backend.Id;
+        try { if (!backend.HasExited) { backend.Kill(); backend.WaitForExit(3000); } } catch (InvalidOperationException) {}
+        backend.Dispose(); backend = null;
+        string beat = Path.Combine(workspace,"INSUI\\helper\\helper.json");
+        try {
+            var value = json.Deserialize<Dictionary<string,object>>(File.ReadAllText(beat));
+            if (Convert.ToInt32(value["pid"]) == own) { value["beat"] = 0; File.WriteAllText(beat,json.Serialize(value),new System.Text.UTF8Encoding(false)); }
+        } catch (IOException) {} catch (ArgumentException) {} catch (KeyNotFoundException) {}
+    }
+    void TogglePause(object sender, EventArgs e) {
+        if (backend == null) { StartBackend(); return; }
+        StopBackend(); paused = true; pauseButton.Text = "resume helper"; RefreshStatus();
+    }
+    void RefreshStatus() {
+        if (exitEvent.WaitOne(0)) { Quit(); return; }
+        if (openEvent.WaitOne(0)) Reveal();
+        if (installed && updates.Checked && DateTime.UtcNow >= nextCheck && !checking && pendingStage == null) CheckUpdates(false);
+        if (backend == null) {
+            if (paused) { mode = "paused"; heading.Text = "paused"; detail.Text = "windows features are paused. your scripts can continue."; scripts.Text = "resume whenever you need the helper again."; }
+            tray.Text = "matcha helper — " + (paused ? "paused" : "ready"); return;
+        }
+        if (backend.HasExited) { mode = "offline"; heading.Text = "helper stopped"; detail.Text = "another helper may be using port 47210. close it, then resume."; scripts.Text = ""; StopBackend(); paused = true; pauseButton.Text = "resume helper"; return; }
+        try {
+            var value = json.Deserialize<Dictionary<string,object>>(File.ReadAllText(Path.Combine(workspace,"INSUI\\helper\\helper.json")));
+            if (Convert.ToInt32(value["pid"]) != backend.Id) return;
+            mode = Convert.ToString(value["mode"]);
+            var names = json.ConvertToType<string[]>(value["active"]);
+            heading.Text = mode == "awake" ? "awake" : "sleeping";
+            detail.Text = mode == "awake" ? "connected. enabled windows features are ready." : "waiting for a script. automatic features are resting.";
+            scripts.Text = names.Length > 0 ? String.Join(" · ",names) : "load a script in Matcha — i'll wake up automatically.";
+            tray.Text = "matcha helper — " + heading.Text;
+            if (pendingStage != null && HelperUpdater.CanApply(installed,backend != null,paused,mode,updates.Checked,requestedUpdate)) ApplyUpdate();
+        } catch (IOException) {} catch (ArgumentException) {} catch (KeyNotFoundException) {}
+    }
+    void CheckUpdates(bool manual) {
+        if (checking || applying) return;
+        if (pendingStage != null) { requestedUpdate |= manual; updateLabel.Text = "update ready · waiting for scripts to sleep"; return; }
+        checking = true; requestedUpdate = manual; nextCheck = DateTime.UtcNow.AddHours(4); updateLabel.Text = "checking signed GitHub releases…";
+        Task.Run(delegate {
+            string stage = null, message = "v1.2.0 · up to date";
+            try {
+                var candidate = HelperUpdater.Check(Assembly.GetExecutingAssembly().GetName().Version, Program.Resource("UpdateKey"));
+                if (candidate != null) { stage = HelperUpdater.Stage(candidate,HelperUpdater.Download(candidate.Url,HelperUpdater.MaxPackage)); message = "v"+candidate.Manifest.version+" ready · waiting for sleep"; }
+            } catch { message = "update unavailable · current version keeps working"; }
+            try { if (!exiting && !IsDisposed) BeginInvoke((Action)delegate { checking = false; pendingStage = stage; updateLabel.Text = message; }); } catch (InvalidOperationException) {}
+        });
+    }
+    void ApplyUpdate() {
+        if (applying || pendingStage == null || !HelperUpdater.CanApply(installed,backend != null,paused,mode,updates.Checked,requestedUpdate)) return;
+        applying = true;
+        try {
+            var info = new ProcessStartInfo(Program.PS,"-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \""+Path.Combine(pendingStage,"install.ps1")+"\" -Update -Tray -WaitPid "+Process.GetCurrentProcess().Id) {UseShellExecute = false, CreateNoWindow = true};
+            Process.Start(info); Quit();
+        } catch { applying = false; updateLabel.Text = "update could not start · try again later"; }
+    }
+    void OpenSource() { Process.Start("notepad.exe","\"" + Path.Combine(runtime,"source-code.txt") + "\""); }
+    string SetupStage() {
+        string stage = Path.Combine(Program.Root,"setup"); Program.CheckPath(stage); Directory.CreateDirectory(stage);
+        File.Copy(Application.ExecutablePath,Path.Combine(stage,"matcha-helper.exe"),true);
+        Program.Write(Path.Combine(stage,"install.ps1"),Program.Resource("Installer"));
+        Program.Write(Path.Combine(stage,"source-code.txt"),Program.Resource("Source"));
+        Program.Write(Path.Combine(stage,"README.txt"),Program.Resource("Readme"));
+        return stage;
+    }
+    void Install(object sender, EventArgs e) {
+        try { string stage = SetupStage(); StopBackend(); Process.Start(new ProcessStartInfo(Program.PS,"-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \"" + Path.Combine(stage,"install.ps1") + "\" -Workspace \"" + workspace + "\" -WaitPid " + Process.GetCurrentProcess().Id) {UseShellExecute = false, CreateNoWindow = true}); Quit(); }
+        catch (Exception error) { Error(error); }
+    }
+    void Uninstall(object sender, EventArgs e) {
+        if (MessageBox.Show(this,"remove the helper and its login shortcut?\nmanaged files go to the recycle bin. script settings stay in place.","uninstall matcha helper",MessageBoxButtons.OKCancel,MessageBoxIcon.Question) != DialogResult.OK) return;
+        try { string stage = SetupStage(); Process.Start(new ProcessStartInfo(Program.PS,"-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \"" + Path.Combine(stage,"install.ps1") + "\" -Uninstall -WaitPid " + Process.GetCurrentProcess().Id) {UseShellExecute = false, CreateNoWindow = true}); Quit(); }
+        catch (Exception error) { Error(error); }
+    }
+    void Quit() { exiting = true; timer.Stop(); StopBackend(); tray.Visible = false; Close(); }
+    protected override void Dispose(bool disposing) {
+        if (disposing) { timer.Dispose(); openEvent.Dispose(); exitEvent.Dispose(); if (tray != null) tray.Dispose(); if (backend != null) StopBackend(); }
+        base.Dispose(disposing);
+    }
+    static Icon MakeIcon() {
+        using (var bitmap = new Bitmap(32,32)) using (var g = Graphics.FromImage(bitmap)) {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var brush = new SolidBrush(Color.FromArgb(160,225,193))) {
+                g.FillEllipse(brush,3,12,24,15); g.FillPolygon(brush,new Point[] {new Point(24,20),new Point(29,7),new Point(31,13),new Point(29,23)});
+                g.FillRectangle(brush,11,6,2,7); g.FillEllipse(brush,8,4,5,3); g.FillEllipse(brush,13,3,5,3);
+            }
+            using (var eye = new SolidBrush(Color.FromArgb(14,18,16))) g.FillEllipse(eye,8,17,3,3);
+            IntPtr handle = bitmap.GetHicon(); try { return (Icon)Icon.FromHandle(handle).Clone(); } finally { DestroyIcon(handle); }
+        }
+    }
+    [DllImport("user32.dll")] static extern bool DestroyIcon(IntPtr icon);
+}
+
+===== Updater.cs =====
+// Only stable releases from the fixed owner repository, signed by the pinned release key.
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.IO.Compression;
+using System.Net;
+using System.Security.Cryptography;
+using System.Text;
+using System.Web.Script.Serialization;
+
+sealed class ReleaseAsset { public string name {get;set;} public string browser_download_url {get;set;} }
+sealed class ReleaseInfo { public string tag_name {get;set;} public bool draft {get;set;} public bool prerelease {get;set;} public ReleaseAsset[] assets {get;set;} }
+sealed class UpdateManifest { public int schema {get;set;} public string version {get;set;} public string package {get;set;} public long size {get;set;} public string sha256 {get;set;} public long expires {get;set;} }
+sealed class UpdateCandidate { public UpdateManifest Manifest; public string Url; }
+static class HelperUpdater {
+    internal const string Repository = "adorablewhale/matcha-helper";
+    internal const int MaxPackage = 8 * 1024 * 1024;
+    internal static bool CanApply(bool installed, bool backendRunning, bool paused, string mode, bool automatic, bool manual) {
+        return installed && backendRunning && !paused && mode == "sleeping" && (automatic || manual);
+    }
+    static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = 262144 };
+    static readonly HashSet<string> Files = new HashSet<string>(StringComparer.Ordinal) {
+        "matcha-helper.exe", "installer.exe", "source-code.txt", "README.txt", "install.ps1", "MatchaHelper.cs", "Installer.cs", "Updater.cs",
+        "backend.ps1", "build.ps1", "sign-release.ps1", "publish.ps1", "update-public-key.xml", "SHA256SUMS.txt", "uninstall.cmd", "matcha.ico"
+    };
+    internal static Version Normalize(string s) {
+        Version v; if (!Version.TryParse(s, out v)) throw new InvalidDataException("Invalid release version.");
+        return new Version(v.Major, v.Minor, Math.Max(0,v.Build), Math.Max(0,v.Revision));
+    }
+    internal static byte[] Download(string url, int maximum) {
+        ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+        Uri uri = new Uri(url); var clock = Stopwatch.StartNew();
+        for (int redirect = 0; redirect < 5; redirect++) {
+            if (uri.Scheme != "https" || !String.IsNullOrEmpty(uri.UserInfo) || !uri.IsDefaultPort ||
+                !(uri.Host == "api.github.com" || uri.Host == "github.com" || uri.Host == "release-assets.githubusercontent.com" || uri.Host == "objects.githubusercontent.com"))
+                throw new InvalidDataException("Update host is not allowed.");
+            var request = (HttpWebRequest)WebRequest.Create(uri); request.AllowAutoRedirect = false;
+            request.Timeout = 15000; request.ReadWriteTimeout = 15000; request.UserAgent = "MatchaHelper/1.2";
+            using (var response = (HttpWebResponse)request.GetResponse()) {
+                if ((int)response.StatusCode >= 300 && (int)response.StatusCode < 400) {
+                    uri = new Uri(uri, response.Headers["Location"]); continue;
+                }
+                if (response.StatusCode != HttpStatusCode.OK || response.ContentLength > maximum) throw new InvalidDataException("Update download rejected.");
+                using (var output = new MemoryStream()) using (var stream = response.GetResponseStream()) {
+                    byte[] chunk = new byte[16384]; int count;
+                    while ((count = stream.Read(chunk,0,chunk.Length)) > 0) {
+                        if (output.Length + count > maximum || clock.Elapsed.TotalSeconds > 60) throw new InvalidDataException("Update download exceeded its limit.");
+                        output.Write(chunk,0,count);
+                    }
+                    return output.ToArray();
+                }
+            }
+        }
+        throw new InvalidDataException("Too many update redirects.");
+    }
+    internal static UpdateManifest Verify(byte[] manifest, byte[] signature, string publicKey, Version current) {
+        if (manifest.Length > 16384 || signature.Length > 2048) throw new InvalidDataException("Invalid update metadata size.");
+        using (var rsa = new RSACryptoServiceProvider()) {
+            rsa.PersistKeyInCsp = false; rsa.FromXmlString(publicKey);
+            if (!rsa.VerifyData(manifest,"SHA256",Convert.FromBase64String(Encoding.UTF8.GetString(signature).Trim()))) throw new InvalidDataException("Update signature is invalid.");
+        }
+        var m = Json.Deserialize<UpdateManifest>(Encoding.UTF8.GetString(manifest));
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        if (m == null || m.schema != 1 || m.package != "matcha-helper.zip" || m.size < 1 || m.size > MaxPackage ||
+            !System.Text.RegularExpressions.Regex.IsMatch(m.sha256 ?? "", "^[a-f0-9]{64}$") || m.expires < now || m.expires > now + 370L*86400)
+            throw new InvalidDataException("Invalid or expired update manifest.");
+        if (Normalize(m.version) <= current) return null;
+        return m;
+    }
+    internal static UpdateCandidate Check(Version current, string publicKey) {
+        return Check(Download("https://api.github.com/repos/"+Repository+"/releases/latest",262144), current, publicKey, Download);
+    }
+    internal static UpdateCandidate Check(byte[] releaseJson, Version current, string publicKey, Func<string,int,byte[]> fetch) {
+        var release = Json.Deserialize<ReleaseInfo>(Encoding.UTF8.GetString(releaseJson));
+        if (release == null || release.draft || release.prerelease || release.assets == null || release.assets.Length > 20) throw new InvalidDataException("Not a stable helper release.");
+        string version = (release.tag_name ?? "").TrimStart('v'); Normalize(version);
+        string prefix = "https://github.com/"+Repository+"/releases/download/v"+version+"/";
+        var assets = new Dictionary<string,string>(StringComparer.Ordinal);
+        foreach (var a in release.assets) {
+            if (a.name == "update.json" || a.name == "update.sig" || a.name == "matcha-helper.zip") {
+                if (assets.ContainsKey(a.name) || a.browser_download_url != prefix + a.name) throw new InvalidDataException("Unexpected release asset.");
+                assets.Add(a.name,a.browser_download_url);
+            }
+        }
+        if (assets.Count != 3) throw new InvalidDataException("The release is incomplete.");
+        var m = Verify(fetch(assets["update.json"],16384),fetch(assets["update.sig"],2048),publicKey,current);
+        if (m == null) return null;
+        if (Normalize(m.version) != Normalize(version)) throw new InvalidDataException("Release version mismatch.");
+        return new UpdateCandidate {Manifest = m, Url = assets["matcha-helper.zip"]};
+    }
+    internal static string Stage(UpdateCandidate update, byte[] package) {
+        ValidatePackage(update.Manifest,package);
+        string stage = Path.Combine(Program.Root,"updates",Guid.NewGuid().ToString("N")); Program.CheckPath(stage); Directory.CreateDirectory(stage);
+        using (var zip = new ZipArchive(new MemoryStream(package),ZipArchiveMode.Read)) {
+            foreach (var entry in zip.Entries) {
+                string path = Path.Combine(stage,entry.FullName); Program.CheckPath(path);
+                using (var source = entry.Open()) using (var dest = File.Create(path)) source.CopyTo(dest);
+            }
+        }
+        if (Normalize(FileVersionInfo.GetVersionInfo(Path.Combine(stage,"matcha-helper.exe")).FileVersion) != Normalize(update.Manifest.version)) throw new InvalidDataException("Helper binary version mismatch.");
+        return stage;
+    }
+    internal static void ValidatePackage(UpdateManifest m, byte[] package) {
+        if (package.LongLength != m.size || package.Length > MaxPackage) throw new InvalidDataException("Update size mismatch.");
+        using (var hash = SHA256.Create()) {
+            string digest = BitConverter.ToString(hash.ComputeHash(package)).Replace("-","").ToLowerInvariant();
+            if (digest != m.sha256) throw new InvalidDataException("Update checksum mismatch.");
+        }
+        var found = new HashSet<string>(StringComparer.Ordinal); long total = 0;
+        using (var zip = new ZipArchive(new MemoryStream(package),ZipArchiveMode.Read)) {
+            foreach (var entry in zip.Entries) {
+                total += entry.Length;
+                if (!Files.Contains(entry.FullName) || !found.Add(entry.FullName) || entry.Length > MaxPackage || total > 32*1024*1024 ||
+                    ((entry.ExternalAttributes >> 16) & 0xF000) == 0xA000) throw new InvalidDataException("Unsafe update package contents.");
+            }
+        }
+        foreach (var name in new[] {"matcha-helper.exe","install.ps1","source-code.txt","README.txt","SHA256SUMS.txt"})
+            if (!found.Contains(name)) throw new InvalidDataException("Update package is missing a required file.");
+    }
+}
+
+===== Installer.cs =====
+// Single-file per-user installer; its resources contain the complete helper and readable source.
+using System;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+[assembly: AssemblyTitle("Matcha helper installer")]
+[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyFileVersion("1.2.0.0")]
+static class InstallerMain {
+    [DllImport("shell32.dll")] static extern int SHGetKnownFolderPath(ref Guid id,uint flags,IntPtr token,out IntPtr path);
+    internal static string Folder(string name) {
+        var id=new Guid(name); IntPtr ptr; int hr=SHGetKnownFolderPath(ref id,0x10000,IntPtr.Zero,out ptr);
+        if(hr!=0) Marshal.ThrowExceptionForHR(hr);
+        try{return Marshal.PtrToStringUni(ptr);}finally{Marshal.FreeCoTaskMem(ptr);}
+    }
+    internal static readonly string Root=Path.Combine(Folder("F1B32785-6FBA-4FCF-9D55-7B8E7F157091"),"matcha-helper");
+    internal static string Workspace {
+        get { string f=Path.Combine(Root,"workspace.txt"); return File.Exists(f) ? File.ReadAllText(f).Trim() : "C:\\matcha\\workspace"; }
+    }
+    [STAThread] static void Main(string[] args) {
+        Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
+        try {
+            if(Array.IndexOf(args,"--install")>=0){Install(Workspace,Array.IndexOf(args,"--no-startup")<0,Array.IndexOf(args,"--no-launch")>=0); return;}
+            Application.Run(new InstallerWindow());
+        } catch(Exception e){Environment.ExitCode=1; if(Array.IndexOf(args,"--install")<0)MessageBox.Show(e.Message,"Matcha helper setup",MessageBoxButtons.OK,MessageBoxIcon.Error);}
+    }
+    internal static void Install(string workspace,bool startup,bool noLaunch) {
+        if(!Directory.Exists(workspace))throw new IOException("Choose the workspace folder used by Matcha.");
+        string stage=Path.Combine(Root,"setup",Guid.NewGuid().ToString("N"));
+        for(string p=stage;!String.IsNullOrEmpty(p);p=Path.GetDirectoryName(p))
+            if((Directory.Exists(p)||File.Exists(p))&&(File.GetAttributes(p)&FileAttributes.ReparsePoint)!=0)throw new IOException("Linked installation folders are not supported.");
+        Directory.CreateDirectory(stage);
+        foreach(var item in new[] {new[] {"HelperBinary","matcha-helper.exe"},new[] {"Source","source-code.txt"},new[] {"Installer","install.ps1"},new[] {"Readme","README.txt"}}) {
+            using(var source=Assembly.GetExecutingAssembly().GetManifestResourceStream(item[0]))using(var dest=File.Create(Path.Combine(stage,item[1])))source.CopyTo(dest);
+        }
+        string ps=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System),"WindowsPowerShell\\v1.0\\powershell.exe");
+        var info=new ProcessStartInfo(ps,"-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \""+Path.Combine(stage,"install.ps1")+"\" -Workspace \""+workspace+"\""+(startup?"":" -NoStartup")+(noLaunch?" -NoLaunch":"")) {UseShellExecute=false,CreateNoWindow=true,RedirectStandardOutput=true,RedirectStandardError=true};
+        using(var proc=Process.Start(info)) {
+            var output=proc.StandardOutput.ReadToEndAsync();var error=proc.StandardError.ReadToEndAsync();
+            if(!proc.WaitForExit(90000))throw new IOException("Setup is taking longer than expected. Close the helper and try again.");
+            Task.WaitAll(output,error);if(proc.ExitCode!=0)throw new IOException("Setup could not finish. Check your workspace and close any older helper, then try again.");
+        }
+    }
+}
+sealed class InstallerWindow:Form {
+    TextBox workspace;CheckBox startup;Button install;Label status;
+    readonly Color ink=Color.FromArgb(235,239,236),mint=Color.FromArgb(160,225,193);
+    public InstallerWindow() {
+        Text="Matcha helper setup";ClientSize=new Size(540,460);BackColor=Color.FromArgb(14,18,16);ForeColor=ink;Font=new Font("Segoe UI",10);
+        FormBorderStyle=FormBorderStyle.FixedDialog;MaximizeBox=false;StartPosition=FormStartPosition.CenterScreen;
+        var iconStream=Assembly.GetExecutingAssembly().GetManifestResourceStream("Icon");if(iconStream!=null)using(iconStream)Icon=new Icon(iconStream);
+        LabelAt("adorablewhale / windows",28,22,460,22,9);
+        LabelAt("install matcha helper",28,62,480,44,25);
+        LabelAt("one install. a quiet tray icon. ready when your scripts are.",30,113,480,28,10);
+        LabelAt("YOUR MATCHA WORKSPACE",30,169,450,22,9);
+        workspace=new TextBox {Text=InstallerMain.Workspace,Location=new Point(30,199),Size=new Size(363,30),BackColor=Color.FromArgb(23,29,26),ForeColor=ink};Controls.Add(workspace);
+        ButtonAt("browse",404,194,106,delegate {using(var d=new FolderBrowserDialog {SelectedPath=workspace.Text,Description="Select Matcha's workspace folder"})if(d.ShowDialog(this)==DialogResult.OK)workspace.Text=d.SelectedPath;},false);
+        startup=new CheckBox {Text="start in the system tray when i sign in",Location=new Point(30,251),Size=new Size(480,30),Checked=true};Controls.Add(startup);
+        LabelAt("adds a Start menu shortcut — search “matcha helper”.\nsigned GitHub updates apply while sleeping; you can turn them off.\nreadable source is included. no administrator rights needed.",30,299,480,70,10);
+        install=ButtonAt("install and open",30,386,225,async delegate {
+            install.Enabled=false;workspace.Enabled=false;startup.Enabled=false;status.Text="installing…";
+            string folder=workspace.Text;bool login=startup.Checked;
+            try {await Task.Run(delegate {InstallerMain.Install(folder,login,false);});status.Text="installed · ready in your tray";install.Text="installed";}
+            catch(Exception e){status.Text="setup needs attention";install.Enabled=true;MessageBox.Show(this,e.Message,"Matcha helper setup");}
+        },true);
+        status=LabelAt("v1.2.0 · windows 10 / 11",274,397,245,35,9);
+    }
+    Label LabelAt(string text,int x,int y,int w,int h,float size){var l=new Label {Text=text,Location=new Point(x,y),Size=new Size(w,h),Font=new Font("Segoe UI",size),ForeColor=ink};Controls.Add(l);return l;}
+    Button ButtonAt(string text,int x,int y,int width,EventHandler click,bool primary){var b=new Button {Text=text,Location=new Point(x,y),Size=new Size(width,38),FlatStyle=FlatStyle.Flat,BackColor=primary?mint:Color.FromArgb(23,29,26),ForeColor=primary?Color.FromArgb(14,18,16):ink};b.FlatAppearance.BorderSize=primary?0:1;b.Click+=click;Controls.Add(b);return b;}
+}
+
+===== backend.ps1 =====
+$ErrorActionPreference = 'Stop'
+$Version = '1.2.0'
+$Port = 47210
+$StallSec = 120
+$Workspace = 'C:\matcha\workspace'
+if ($env:FH_ARG -and (Test-Path -LiteralPath $env:FH_ARG -PathType Container)) { $Workspace = [IO.Path]::GetFullPath($env:FH_ARG) }
+$Token = [Guid]::NewGuid().ToString('N')
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class FHWin {
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr pid);
+  [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool attach);
+  [DllImport("user32.dll")] static extern uint MapVirtualKey(uint code, uint type);
+  [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [StructLayout(LayoutKind.Sequential)] struct LII { public uint cbSize; public uint dwTime; }
+  [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LII p);
+  public static uint IdleMs() {
+    LII i = new LII();
+    i.cbSize = (uint)Marshal.SizeOf(typeof(LII));
+    if (!GetLastInputInfo(ref i)) return 0;
+    return unchecked((uint)Environment.TickCount - i.dwTime);
+  }
+  [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
+  [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int n);
+  public static bool Focus(IntPtr h) {
+    for (int i = 0; i < 6; i++) {
+      IntPtr fg = GetForegroundWindow();
+      if (fg == h) return true;
+      if (IsIconic(h)) ShowWindow(h, 9);
+      uint me = GetCurrentThreadId();
+      uint them = GetWindowThreadProcessId(fg, IntPtr.Zero);
+      uint target = GetWindowThreadProcessId(h, IntPtr.Zero);
+      AttachThreadInput(me, them, true); AttachThreadInput(me, target, true);
+      try {
+        if (i > 0) { keybd_event(0x12, 0, 0, UIntPtr.Zero); keybd_event(0x12, 0, 2, UIntPtr.Zero); }
+        BringWindowToTop(h); SetForegroundWindow(h);
+      } finally { AttachThreadInput(me, target, false); AttachThreadInput(me, them, false); }
+      System.Threading.Thread.Sleep(60);
+    }
+    return GetForegroundWindow() == h;
+  }
+  public static void Tap(byte vk) {
+    byte scan = (byte)MapVirtualKey(vk, 0);
+    keybd_event(vk, scan, 0, UIntPtr.Zero);
+    System.Threading.Thread.Sleep(90);
+    keybd_event(vk, scan, 2, UIntPtr.Zero);
+  }
+}
+'@
+
+# Screenshots of the Roblox window, and nothing else. PrintWindow with PW_RENDERFULLCONTENT asks
+# Windows for Roblox's own picture (client area only), which works even behind other windows and
+# never includes them. Only if that comes back black is the screen copied, and only when Roblox is
+# the window in front AND no other window (an overlay, a popup, a notification) overlaps it.
+$script:CanShot = $false
+try {
+  Add-Type -ReferencedAssemblies System.Drawing @'
+using System;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Runtime.InteropServices;
+public static class FHShot {
+  [StructLayout(LayoutKind.Sequential)] struct RECT { public int L, T, R, B; }
+  [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
+  [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr h, ref POINT p);
+  [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
+  [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int value, int size);
+  public static string Why = "";
+  // True when a visible window of another program sits above Roblox over the given screen area.
+  static bool Covered(IntPtr h, int l, int t, int r, int b) {
+    uint mine; GetWindowThreadProcessId(h, out mine);
+    for (IntPtr w = GetWindow(h, 3); w != IntPtr.Zero; w = GetWindow(w, 3)) { // 3 = GW_HWNDPREV, the next window up
+      if (!IsWindowVisible(w)) continue;
+      int cloaked = 0;
+      if (DwmGetWindowAttribute(w, 14, out cloaked, 4) == 0 && cloaked != 0) continue; // 14 = DWMWA_CLOAKED
+      uint pid; GetWindowThreadProcessId(w, out pid);
+      if (pid == mine) continue;
+      RECT x;
+      if (!GetWindowRect(w, out x)) continue;
+      if (x.R <= l || x.L >= r || x.B <= t || x.T >= b) continue;
+      return true;
+    }
+    return false;
+  }
+  static bool Blank(Bitmap b) {
+    for (int y = 1; y < 10; y++) for (int x = 1; x < 10; x++) {
+      Color c = b.GetPixel(b.Width * x / 10, b.Height * y / 10);
+      if (c.R > 8 || c.G > 8 || c.B > 8) return false;
+    }
+    return true;
+  }
+  public static byte[] Capture(IntPtr h, int maxWidth) {
+    Why = "";
+    if (IsIconic(h)) { Why = "Roblox is minimized"; return null; }
+    RECT r;
+    if (!GetClientRect(h, out r)) { Why = "no Roblox window"; return null; }
+    int w = r.R - r.L, ht = r.B - r.T;
+    if (w < 64 || ht < 64) { Why = "Roblox window too small"; return null; }
+    Bitmap bmp = new Bitmap(w, ht, PixelFormat.Format32bppArgb);
+    Bitmap small = null;
+    try {
+      using (Graphics g = Graphics.FromImage(bmp)) {
+        IntPtr dc = g.GetHdc();
+        bool ok = PrintWindow(h, dc, 3); // PW_CLIENTONLY | PW_RENDERFULLCONTENT
+        g.ReleaseHdc(dc);
+        if (!ok || Blank(bmp)) {
+          if (GetForegroundWindow() != h) { Why = "Roblox came back black and isn't the window in front, so nothing was captured"; return null; }
+          POINT p = new POINT();
+          ClientToScreen(h, ref p);
+          if (Covered(h, p.X, p.Y, p.X + w, p.Y + ht)) { Why = "another window is over Roblox, so nothing was captured"; return null; }
+          g.CopyFromScreen(p.X, p.Y, 0, 0, new Size(w, ht));
+        }
+      }
+      Bitmap outBmp = bmp;
+      if (w > maxWidth) { small = new Bitmap(bmp, new Size(maxWidth, (int)((long)ht * maxWidth / w))); outBmp = small; }
+      ImageCodecInfo jpg = null;
+      foreach (ImageCodecInfo c in ImageCodecInfo.GetImageEncoders()) { if (c.MimeType == "image/jpeg") jpg = c; }
+      EncoderParameters ep = new EncoderParameters(1);
+      ep.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, 82L);
+      using (MemoryStream ms = new MemoryStream()) { outBmp.Save(ms, jpg, ep); return ms.ToArray(); }
+    } catch (Exception e) { Why = e.Message; return null; }
+    finally { bmp.Dispose(); if (small != null) small.Dispose(); }
+  }
+}
+'@
+  [void][FHWin]::SetProcessDPIAware()
+  $script:CanShot = $true
+} catch { }
+$script:ShotWhy = ''
+$script:LiveShot = $null
+$script:LiveShotAt = [DateTime]::MinValue
+$script:ShotNote = if ($script:CanShot) { 'ready (turn on "Screenshot in webhook" in FischHub)' } else { 'not available on this PC' }
+
+$Html = @'
+<!doctype html>
+<html lang="en" data-theme="dark"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Matcha helper</title>
+<style>
+:root{color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;--raised:#242423;--ink:#fff;--muted:#a3a198;--border:#333;--accent:#3987e5}
+:root[data-theme=light]{color-scheme:light;--page:#f9f9f7;--surface:#fcfcfb;--raised:#f0efea;--ink:#111;--muted:#65645e;--border:#ddd}
+*{box-sizing:border-box}body{margin:0;background:var(--page);color:var(--ink);font:14px/1.5 'Segoe UI',sans-serif}header{border-bottom:1px solid var(--border);padding:16px 24px;display:flex;gap:16px;align-items:center;flex-wrap:wrap}h1{font-size:18px;margin:0}nav{display:flex;gap:8px;flex-wrap:wrap}main{max-width:1400px;margin:auto;padding:24px;display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:16px}.card{grid-column:span 6;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px;min-width:0}.full{grid-column:span 12}h2{font-size:14px;margin:0 0 12px}button,input,select{font:inherit;color:inherit;background:var(--raised);border:1px solid var(--border);border-radius:8px;padding:7px 10px;max-width:100%}button{cursor:pointer}button[aria-pressed=true]{background:var(--accent);color:white}button:disabled,input:disabled,select:disabled{opacity:.45;cursor:default}label,.row{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:9px 0;border-top:1px solid var(--border)}label span{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:330px;overflow:auto;margin:0}.muted{color:var(--muted)}#notice{margin-left:auto}#stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px}.stat{padding:12px;background:var(--raised);border-radius:8px}.stat b{display:block;font-size:24px}.actions{display:flex;gap:8px;flex-wrap:wrap}#shot{width:100%;max-height:540px;object-fit:contain;background:var(--page);border-radius:8px}.help{font-size:12px;color:var(--muted)}input[type=range]{width:180px}output{min-width:44px;text-align:right}.tools{display:flex;gap:10px;flex-wrap:wrap}@media(max-width:800px){.card{grid-column:span 12}main{padding:16px}header{padding:16px}.row{flex-wrap:wrap}.row>span{width:100%}input[type=range]{width:160px}}
+</style>
+<header><h1>Matcha helper</h1><nav id="tabs" aria-label="Scripts"></nav><button id="theme">Theme</button><span id="notice" class="muted" role="status">Connecting</span></header>
+<main>
+<section class="card"><h2 id="title">Waiting for a script</h2><pre id="status">Load an INSUI script with helper support.</pre><p class="help" id="age"></p></section>
+<section class="card"><h2>Stats</h2><div id="stats"></div></section>
+<section class="card"><h2>Controls</h2><div id="controls"></div><div class="actions" id="actions"></div></section>
+<section class="card"><h2>Features for this script</h2><div id="features"></div><label><span>Background AFK interval (minutes)</span><input id="minutes" type="number" min="1" max="120" value="10"></label><p class="help">AFK waits until you have been idle for 3 seconds. It briefly focuses Roblox, taps O/I, then restores focus. Files and clipboard tools use this computer only.</p><p id="helperNote" class="help"></p></section>
+<section class="card full"><h2>Roblox view</h2><img id="shot" alt="Roblox client window" hidden><p id="shotNote" class="help">Roblox only. Matcha's overlay may be invisible.</p><button id="view">Start live view</button></section>
+<section class="card"><h2>Log (last 40)</h2><pre id="log"></pre></section>
+<section class="card"><h2>Tools</h2><div class="tools"><button id="install">Install autoexec loader</button><button id="clipboard">Clipboard test</button></div><p id="toolNote" class="help"></p></section>
+</main>
+<script>
+'use strict';
+const TOKEN='__HELPER_TOKEN__', $=id=>document.getElementById(id), arr=x=>Array.isArray(x)?x:[];
+let selected='', state=null, spec=null, stamp='', live=false, objectUrl=null, pending=new Map();
+function el(tag,text){const e=document.createElement(tag);if(text!=null)e.textContent=text;return e}
+function note(t){$('notice').textContent=t}
+async function api(path,body){const r=await fetch(path,{method:body===undefined?'GET':'POST',headers:{'X-Helper-Token':TOKEN,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store'});const j=await r.json();if(!r.ok)throw Error(j.error||'HTTP '+r.status);return j}
+async function cmd(body,label){const c=arr(spec?.controls).find(c=>c.path===body.set);if(c?.risk&&body.value!==false&&!confirm(label+'?')){document.activeElement?.blur();await poll();return}try{const j=await api('/api/cmd',{script:selected,...body});pending.set(j.id,{label,t:Date.now()});note(label+': waiting for script')}catch(e){note(e.message)}}
+function control(c){const row=el('label'), name=el('span',c.tab+' / '+c.section+' / '+c.name);row.className='row';row.append(name);let inp;
+if(c.kind==='toggle'){inp=el('input');inp.type='checkbox';inp.checked=c.value===true;inp.onchange=()=>cmd({set:c.path,value:inp.checked},c.name)}
+else if(c.kind==='dropdown'){inp=el('select');inp.multiple=!!c.multi;for(const v of arr(c.choices)){const o=el('option',String(v));o.value=String(v);o.selected=arr(c.value).includes(v);inp.append(o)}inp.onchange=()=>cmd({set:c.path,value:Array.from(inp.selectedOptions).map(o=>o.value)},c.name)}
+else{inp=el('input');inp.type=c.kind==='slider'?'range':'text';inp.value=c.value??'';if(c.kind==='slider'){inp.min=c.min;inp.max=c.max;inp.step=c.step;const out=el('output',String(c.value)+' '+(c.suffix||''));inp.oninput=()=>out.textContent=inp.value+' '+(c.suffix||'');row.append(out)}inp.onchange=()=>cmd({set:c.path,value:c.kind==='slider'?Number(inp.value):inp.value},c.name)}
+inp.setAttribute('aria-label',c.name);inp.dataset.path=c.path;inp.disabled=c.disabled===true;row.append(inp);return row}
+async function choose(name){selected=name;stamp='';pending.clear();$('controls').replaceChildren();$('actions').replaceChildren();await poll()}
+async function poll(){try{const list=await api('/api/scripts');if(!selected&&arr(list.scripts).length)selected=list.scripts[0].name;
+$('tabs').replaceChildren(...arr(list.scripts).map(s=>{const b=el('button',s.name);b.setAttribute('aria-pressed',String(s.name===selected));b.onclick=()=>choose(s.name);return b}));
+if(!selected){note('Waiting for INSUI scripts');return}const name=selected,j=await api('/api/state?script='+encodeURIComponent(name));if(name!==selected)return;state=j.state;const active=!!state&&!state.unloaded&&j.age<15;
+$('title').textContent=name+' '+(state?.version||'');$('status').textContent=arr(state?.status?.lines).join('\n')||'Waiting for state';$('age').textContent=state?.unloaded?'Unloaded':j.age==null?'No state':Math.round(j.age)+' seconds since last update';$('log').textContent=arr(state?.log).join('\n');$('helperNote').textContent=j.note||'';
+$('stats').replaceChildren(...Object.entries(state?.stats||{}).map(([k,v])=>{const d=el('div');d.className='stat';d.append(el('span',k),el('b',String(v)));return d}));
+const ctl=await api('/api/controls?script='+encodeURIComponent(name));if(name!==selected)return;spec=ctl;
+const key=JSON.stringify([arr(ctl.controls).map(({value,...c})=>c),ctl.actions]);if(key!==stamp){stamp=key;const groups=new Map();for(const c of arr(ctl.controls)){const group=c.tab+' / '+c.section;if(!groups.has(group))groups.set(group,[]);groups.get(group).push(c)}$('controls').replaceChildren(...Array.from(groups,([name,cs])=>{const d=el('details');d.open=cs[0].tab!=='Settings'&&cs[0].tab!=='gear';d.append(el('summary',name),...cs.map(control));return d}));$('actions').replaceChildren(...arr(ctl.actions).map(a=>{const b=el('button',a.label);b.onclick=()=>{if(!a.risk||confirm(a.label+'?'))cmd({do:a.id},a.label)};return b}))}
+for(const inp of $('controls').querySelectorAll('input,select')){const c=arr(ctl.controls).find(c=>c.path===inp.dataset.path);inp.disabled=!active||!j.features.dashboard||c?.disabled===true;if(document.activeElement!==inp){const v=state?.rows?.[inp.dataset.path];if(inp.type==='checkbox')inp.checked=v===true;else if(inp.tagName==='SELECT'){for(const o of inp.options)o.selected=arr(v).includes(o.value)}else if(v!=null){inp.value=v;const out=inp.parentElement.querySelector('output');if(out)out.textContent=v+' '+(c?.suffix||'')}}}
+for(const b of $('actions').querySelectorAll('button'))b.disabled=!active||!j.features.dashboard;
+$('features').replaceChildren(...Object.entries(j.features||{}).map(([k,v])=>{const l=el('label'),i=el('input');i.type='checkbox';i.checked=!!v;i.setAttribute('aria-label',k);i.onchange=async()=>{try{await api('/api/config',{script:name,features:{[k]:i.checked}});note(k+': '+(i.checked?'on':'off'))}catch(e){note(e.message)}};l.append(el('span',k),i);return l}));
+if(document.activeElement!==$('minutes'))$('minutes').value=list.afkMinutes||10;
+for(const [id,p] of pending){const r=arr(state?.cmd?.results).find(r=>r.id===id);if(r){note(p.label+': '+r.msg);pending.delete(id)}else if(Date.now()-p.t>15000){note(p.label+': script did not acknowledge');pending.delete(id)}}if(!pending.size)note(active?'Live':state?.unloaded?'Unloaded':'Waiting for script');
+}catch(e){note(e.message)}}
+$('minutes').onchange=()=>api('/api/config',{afkMinutes:Number($('minutes').value)}).catch(e=>note(e.message));
+$('theme').onclick=()=>{document.documentElement.dataset.theme=document.documentElement.dataset.theme==='dark'?'light':'dark';localStorage.setItem('matcha-theme',document.documentElement.dataset.theme)};document.documentElement.dataset.theme=localStorage.getItem('matcha-theme')||'dark';
+$('install').onclick=async()=>{try{await api('/api/install-loader',{});$('toolNote').textContent='Autoexec loader installed'}catch(e){$('toolNote').textContent=e.message}};
+$('clipboard').onclick=async()=>{try{const j=await api('/api/clipboard');$('toolNote').textContent='Clipboard readable ('+j.text.length+' characters). Contents are not shown.'}catch(e){$('toolNote').textContent=e.message}};
+async function shot(){if(!live)return;try{const r=await fetch('/api/shot?w=1280',{headers:{'X-Helper-Token':TOKEN},cache:'no-store'});if((r.headers.get('Content-Type')||'').startsWith('image/')){const u=URL.createObjectURL(await r.blob());$('shot').src=u;$('shot').hidden=false;if(objectUrl)URL.revokeObjectURL(objectUrl);objectUrl=u;$('shotNote').textContent='Roblox client window only'}else{$('shot').hidden=true;$('shotNote').textContent=(await r.json()).why||'No picture'}}catch(e){$('shotNote').textContent=e.message}}
+$('view').onclick=()=>{live=!live;$('view').textContent=live?'Pause live view':'Start live view';shot()};setInterval(()=>{if(!document.hidden)shot()},3000);setInterval(poll,2000);poll();
+</script></html>
+
+'@
+function Say([string]$text, [string]$color = 'Gray') {
+  Write-Host ("  " + (Get-Date -Format 'HH:mm:ss') + "  " + $text) -ForegroundColor $color
+}
+
+function Read-Shared([string]$path, [long]$from = 0) {
+  if (-not (Test-Path -LiteralPath $path)) { return $null }
+  $fs = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'ReadWrite, Delete')
+  try {
+    $len = $fs.Length
+    if ($from -gt $len) { $from = 0 }
+    [void]$fs.Seek($from, [IO.SeekOrigin]::Begin)
+    $buf = New-Object byte[] ($len - $from)
+    $got = 0
+    while ($got -lt $buf.Length) {
+      $n = $fs.Read($buf, $got, $buf.Length - $got)
+      if ($n -le 0) { break }
+      $got += $n
+    }
+    return @{ bytes = $buf; size = $len; from = $from }
+  } finally { $fs.Close() }
+}
+
+function Read-Json([string]$path) {
+  $r = Read-Shared $path
+  if (-not $r) { return $null }
+  try { return ([Text.Encoding]::UTF8.GetString($r.bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json) } catch { return $null }
+}
+
+function Send([Net.Sockets.NetworkStream]$stream, [int]$status, [string]$type, [byte[]]$body, [string]$extra = '') {
+  $reason = if ($status -lt 300) { 'OK' } elseif ($status -eq 404) { 'Not Found' } else { 'Error' }
+  $head = "HTTP/1.1 $status $reason`r`nContent-Type: $type`r`nContent-Length: $($body.Length)`r`nCache-Control: no-store`r`n$($extra)Connection: close`r`n`r`n"
+  $hb = [Text.Encoding]::ASCII.GetBytes($head)
+  $stream.Write($hb, 0, $hb.Length)
+  if ($body.Length -gt 0) { $stream.Write($body, 0, $body.Length) }
+  $stream.Flush()
+}
+
+function Send-Text($stream, [int]$status, [string]$type, [string]$text, [string]$extra = '') {
+  Send $stream $status $type ([Text.Encoding]::UTF8.GetBytes($text)) $extra
+}
+
+function Read-Line($stream) {
+  $sb = New-Object System.Text.StringBuilder
+  while ($true) {
+    $b = $stream.ReadByte()
+    if ($b -lt 0) { return $null }
+    if ($b -eq 10) { break }
+    if ($b -ne 13) { [void]$sb.Append([char]$b) }
+    if ($sb.Length -gt 16384) { return $null }
+  }
+  return $sb.ToString()
+}
+
+function Read-Exact($stream, [int]$count) {
+  $buf = New-Object byte[] $count
+  $got = 0
+  while ($got -lt $count) {
+    $n = $stream.Read($buf, $got, $count - $got)
+    if ($n -le 0) { break }
+    $got += $n
+  }
+  if ($got -lt $count) {
+    $part = New-Object byte[] $got
+    [Array]::Copy($buf, $part, $got)
+    return ,$part
+  }
+  return ,$buf
+}
+
+function Json-Str([string]$s) {
+  return '"' + $s.Replace('\', '\\').Replace('"', '\"').Replace("`r", '').Replace("`n", '\n') + '"'
+}
+
+function Get-Roblox {
+  return Get-Process -Name 'RobloxPlayerBeta' -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+}
+
+# A JPEG of the Roblox window, or $null with the reason in $script:ShotWhy. Webhook pictures also
+# update the note the page shows ($script:ShotNote); the page's own live view doesn't.
+function Take-Shot([int]$maxWidth = 1280, [bool]$forWebhook = $true) {
+  $img = $null
+  if (-not $script:CanShot) { $script:ShotWhy = 'screenshots are not available on this PC' }
+  else {
+    $rb = Get-Roblox
+    if (-not $rb) { $script:ShotWhy = 'no Roblox window' }
+    else {
+      $img = [FHShot]::Capture($rb.MainWindowHandle, $maxWidth)
+      if (-not $img) { $script:ShotWhy = [FHShot]::Why }
+    }
+  }
+  if ($forWebhook) {
+    $script:ShotNote = if ($img) { 'last one ' + (Get-Date -Format 'HH:mm:ss') + ' (' + [int]($img.Length / 1024) + ' KB)' }
+      elseif ($script:CanShot) { 'skipped - ' + $script:ShotWhy } else { 'not available on this PC' }
+  }
+  if ($img) { return ,$img }
+  return $null
+}
+
+# Sends a webhook request to discord. With a screenshot the body becomes multipart: the JSON as
+# payload_json (its first embed shows the picture) plus the file. An edit without a picture
+# clears the previous one (attachments: []).
+function Send-Discord([string]$method, [string]$url, [string]$json, $img, [bool]$isEdit) {
+  if ($img) {
+    $json = ([regex]'"embeds"\s*:\s*\[\s*\{').Replace($json, '$0"image":{"url":"attachment://fischhub.jpg"},', 1)
+    $json = '{"attachments":[{"id":0,"filename":"fischhub.jpg"}],' + $json.TrimStart().Substring(1)
+    $boundary = '----fischhub' + [Guid]::NewGuid().ToString('N')
+    $ms = New-Object IO.MemoryStream
+    $head = [Text.Encoding]::UTF8.GetBytes("--$boundary`r`nContent-Disposition: form-data; name=`"payload_json`"`r`nContent-Type: application/json`r`n`r`n$json`r`n--$boundary`r`nContent-Disposition: form-data; name=`"files[0]`"; filename=`"fischhub.jpg`"`r`nContent-Type: image/jpeg`r`n`r`n")
+    $tail = [Text.Encoding]::ASCII.GetBytes("`r`n--$boundary--`r`n")
+    $ms.Write($head, 0, $head.Length)
+    $ms.Write($img, 0, $img.Length)
+    $ms.Write($tail, 0, $tail.Length)
+    $body = $ms.ToArray()
+    $type = "multipart/form-data; boundary=$boundary"
+  } else {
+    if ($isEdit) { $json = '{"attachments":[],' + $json.TrimStart().Substring(1) }
+    $body = [Text.Encoding]::UTF8.GetBytes($json)
+    $type = 'application/json'
+  }
+  $req = [System.Net.HttpWebRequest]::Create($url)
+  $req.Method = $method
+  $req.ContentType = $type
+  $req.UserAgent = 'FischHub-helper (https://github.com/adorablewhale/fischhub, 2)'
+  $req.Timeout = 20000
+  $req.ContentLength = $body.Length
+  $rs = $req.GetRequestStream()
+  $rs.Write($body, 0, $body.Length)
+  $rs.Close()
+  $resp = $null
+  try {
+    $resp = $req.GetResponse()
+  } catch {
+    $ex = $_.Exception
+    while ($ex -and -not ($ex -is [System.Net.WebException])) { $ex = $ex.InnerException }
+    if ($ex) { $resp = $ex.Response }
+  }
+  if (-not $resp) { return @{ status = 502; text = '{"message":"the helper could not reach discord"}' } }
+  $status = [int]$resp.StatusCode
+  $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+  $text = $reader.ReadToEnd()
+  $resp.Close()
+  return @{ status = $status; text = $text }
+}
+
+# FischHub's webhook requests: an edit (.../messages/<id>, sent on as PATCH) or a new message
+# (sent on as POST ?wait=true). ?shot=1 adds a screenshot.
+function Relay($stream, [string]$path, [string]$query, [byte[]]$body) {
+  $isEdit = $path -match '^/api/webhooks/\d+/[A-Za-z0-9_\-]+/messages/\d+$'
+  $isNew = $path -match '^/api/webhooks/\d+/[A-Za-z0-9_\-]+$'
+  if (-not ($isEdit -or $isNew) -or $body.Length -lt 2) {
+    Send-Text $stream 404 'application/json' '{"message":"the FischHub helper only forwards webhook messages"}'
+    return
+  }
+  $img = $null
+  if ($query -match '(^|&)shot=1') { $img = Take-Shot }
+  $json = [Text.Encoding]::UTF8.GetString($body)
+  $url = 'https://discord.com' + $path + $(if ($isNew) { '?wait=true' } else { '' })
+  $r = Send-Discord $(if ($isEdit) { 'PATCH' } else { 'POST' }) $url $json $img ([bool]$isEdit)
+  Send-Text $stream $r.status 'application/json; charset=utf-8' $r.text
+  $what = if ($isEdit) { 'edited message' } else { 'posted message' }
+  if ($img) { $what += ' + screenshot' }
+  Say ("$what -> discord " + $r.status) $(if ($r.status -lt 300) { 'Green' } else { 'Yellow' })
+}
+
+# Universal protocol. Native capture, Discord relay and HTTP readers below are retained from FischHub.
+$Root = Join-Path $Workspace 'INSUI\helper'
+$ScriptsRoot = Join-Path $Root 'scripts'
+$Utf8 = New-Object Text.UTF8Encoding $false
+$script:Notes = @{}
+$script:Watches = @{}
+$script:LastHelp = [DateTime]::MinValue
+$script:BackgroundAt = Get-Date
+$script:CmdLast = [long]0
+$ConfigFile = Join-Path $Root 'config.json'
+function Write-Json($path, $value) { [IO.File]::WriteAllText($path, (ConvertTo-Json -InputObject $value -Depth 24 -Compress), $Utf8) }
+function Read-Map($path) {
+  $j = Read-Json $path
+  $m = @{}
+  if ($j) { foreach ($p in $j.PSObject.Properties) { $m[$p.Name] = $p.Value } }
+  return $m
+}
+function Get-Config {
+  $c = Read-Map $ConfigFile
+  $s = @{}
+  if ($c.scripts) { foreach ($p in $c.scripts.PSObject.Properties) { $s[$p.Name] = $p.Value } }
+  $c.scripts = $s
+  if (-not $c.afkMinutes) { $c.afkMinutes = 10 }
+  return $c
+}
+function Script-Dir([string]$name) {
+  if ($name -notmatch '^[A-Za-z0-9_-]{1,64}$') { throw 'invalid script name' }
+  $d = Join-Path $ScriptsRoot $name
+  if (Test-Path -LiteralPath $d) { Assert-NoLink $d }
+  return $d
+}
+function Assert-NoLink([string]$path) {
+  $p = $path
+  while ($p) {
+    if (Test-Path -LiteralPath $p) {
+      if ((Get-Item -LiteralPath $p -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'junctions and symlinks are not allowed' }
+    }
+    $parent = Split-Path $p
+    if ($parent -eq $p) { break }
+    $p = $parent
+  }
+}
+function Features($name, $state) {
+  $out = @{ dashboard = $true; webhook = $false; watchdog = $false; afk = $false; files = $false }
+  foreach ($k in @($out.Keys)) {
+    if ($state.features -and $state.features.PSObject.Properties[$k]) { $out[$k] = $state.features.$k -eq $true }
+  }
+  $cfg = Get-Config
+  $saved = $cfg.scripts[$name]
+  foreach ($k in @($out.Keys)) { if ($saved -and $saved.PSObject.Properties[$k]) { $out[$k] = $saved.$k -eq $true } }
+  return $out
+}
+function Get-Scripts {
+  if (-not (Test-Path -LiteralPath $ScriptsRoot)) { return @() }
+  return @(Get-ChildItem -LiteralPath $ScriptsRoot -Directory | Where-Object { $_.Name -match '^[A-Za-z0-9_-]{1,64}$' -and -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) } | ForEach-Object { $_.Name })
+}
+function Script-State($name) {
+  $file = Join-Path (Script-Dir $name) 'state.json'
+  $st = Read-Json $file
+  $age = if ($st) { [Math]::Max(0, ((Get-Date).ToUniversalTime() - (Get-Item -LiteralPath $file).LastWriteTimeUtc).TotalSeconds) } else { $null }
+  return @{ state = $st; age = $age; features = (Features $name $st); note = $script:Notes[$name] }
+}
+function Is-Local($headers) {
+  $h = [string]$headers['host']
+  if ($h -notmatch "^(127\.0\.0\.1|localhost):$Port`$") { return $false }
+  $o = [string]$headers['origin']
+  if ($o -and $o -notmatch "^http://(127\.0\.0\.1|localhost):$Port`$") { return $false }
+  if ($headers['sec-fetch-site'] -eq 'cross-site') { return $false }
+  return $true
+}
+function Has-Key($headers) { return (Is-Local $headers) -and ([string]$headers['x-helper-token'] -ceq $Token) }
+function Reply($stream, $status, $value) { Send-Text $stream $status 'application/json; charset=utf-8' (ConvertTo-Json -InputObject $value -Depth 24 -Compress) }
+function Query-Value($query, $key) {
+  foreach ($p in $query.Split('&')) { $kv = $p.Split('=',2); if ($kv.Length -eq 2 -and $kv[0] -eq $key) { return [Uri]::UnescapeDataString($kv[1].Replace('+',' ')) } }
+  return ''
+}
+function Add-UniversalCommand($stream, $j) {
+  $name = [string]$j.script
+  $d = Script-Dir $name
+  $s = Script-State $name
+  if (-not $s.state -or $s.age -ge 15 -or $s.state.unloaded -or -not $s.features.dashboard) { Reply $stream 409 @{error='script dashboard is not active'}; return }
+  $ctl = Read-Json (Join-Path $d 'controls.json')
+  $c = @{id = ''}
+  if ($j.set -is [string]) {
+    $row = @($ctl.controls | Where-Object { $_.path -ceq $j.set })
+    if ($row.Count -ne 1 -or $row[0].disabled) { throw 'unknown or disabled control' }
+    $c.set = $j.set; $c.value = $j.value
+  } elseif ($j.do -is [string] -and @($ctl.actions | Where-Object { $_.id -ceq $j.do }).Count -eq 1) { $c['do'] = $j.do }
+  else { throw 'unknown command' }
+  $script:CmdLast = [Math]::Max($script:CmdLast + 1, [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+  $c.id = [string]$script:CmdLast; $c.t = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+  $file = Join-Path $d 'commands.txt'
+  Assert-NoLink $file
+  # Bound the queue by acks and age. The client also validates every value and skips the first read.
+  $keep = @()
+  $r = Read-Shared $file
+  if ($r) { foreach ($line in ([Text.Encoding]::UTF8.GetString($r.bytes).Split("`n"))) { try { $old = $line | ConvertFrom-Json; if ([long]$old.id -gt [long]$s.state.cmd.ack -and $c.t - [long]$old.t -lt 120) { $keep += $line } } catch {} } }
+  if ($keep.Count -ge 200) { throw 'command queue full' }
+  $keep += (ConvertTo-Json -InputObject $c -Depth 10 -Compress)
+  [IO.File]::WriteAllText($file, ($keep -join "`n") + "`n", $Utf8)
+  Reply $stream 200 @{id=$c.id}
+}
+function Safe-Write($path, $text) {
+  if ($path -notmatch '^[A-Za-z]:[\\/]') { throw 'absolute path required' }
+  if ($path.Substring(2).Contains(':')) { throw 'alternate data streams are not allowed' }
+  $full = [IO.Path]::GetFullPath($path)
+  $allowed = $false
+  foreach ($base in @('C:\matcha\autoexec','C:\matcha\workspace')) {
+    if ($full.StartsWith($base + '\',[StringComparison]::OrdinalIgnoreCase)) { $allowed = $true }
+  }
+  if (-not $allowed) { throw 'path must be under Matcha autoexec or workspace' }
+  Assert-NoLink $full
+  [void][IO.Directory]::CreateDirectory((Split-Path $full))
+  [IO.File]::WriteAllText($full, $text, $Utf8)
+}
+function Proxy-Http($j) {
+  $uri = $null
+  if (-not [Uri]::TryCreate([string]$j.url,[UriKind]::Absolute,[ref]$uri) -or $uri.Scheme -notin @('http','https') -or $uri.UserInfo) { throw 'http/https URL required' }
+  $method = [string]$j.method
+  if ($method -notmatch '^[A-Z]{3,12}$') { throw 'invalid HTTP method' }
+  $req = [Net.HttpWebRequest]::Create($uri); $req.Method=$method; $req.Timeout=15000; $req.AllowAutoRedirect=$false
+  if ($j.headers) { foreach ($p in $j.headers.PSObject.Properties) { if ($p.Name -ieq 'Content-Type') {$req.ContentType=[string]$p.Value} elseif ($p.Name -ieq 'Accept') {$req.Accept=[string]$p.Value} else {$req.Headers[$p.Name]=[string]$p.Value} } }
+  if ($null -ne $j.body -and $method -notin @('GET','HEAD')) { $b=[Text.Encoding]::UTF8.GetBytes([string]$j.body);$req.ContentLength=$b.Length;$s=$req.GetRequestStream();try{$s.Write($b,0,$b.Length)}finally{$s.Close()} }
+  $resp=$null
+  try { $resp=$req.GetResponse() } catch { $e=$_.Exception;while($e -and -not ($e -is [Net.WebException])){$e=$e.InnerException};if($e){$resp=$e.Response} }
+  if (-not $resp) { return @{status=502;body='request failed';headers=@{}} }
+  try {
+    $rs=$resp.GetResponseStream();$ms=New-Object IO.MemoryStream;$buffer=New-Object byte[] 8192
+    while(($n=$rs.Read($buffer,0,$buffer.Length)) -gt 0){if($ms.Length+$n -gt 1048576){throw 'response too large'};$ms.Write($buffer,0,$n)}
+    $h=@{};foreach($k in $resp.Headers.AllKeys){$h[$k]=$resp.Headers[$k]}
+    return @{status=[int]$resp.StatusCode;headers=$h;body=[Text.Encoding]::UTF8.GetString($ms.ToArray())}
+  } finally {$resp.Close()}
+}
+$script:ActiveNames = @()
+function Universal-Tick {
+  $states = @{}
+  $script:ActiveNames = @()
+  $needsRoblox = $false
+  foreach ($name in (Get-Scripts)) {
+    $state = Script-State $name
+    $states[$name] = $state
+    if ($state.state -and -not $state.state.unloaded -and $state.age -lt 15) {
+      $script:ActiveNames += $name
+      if ($state.features.afk) { $needsRoblox = $true }
+    }
+  }
+  # No process scan, focus, keyboard input or automatic screenshot while sleeping.
+  $rb = if ($needsRoblox) { Get-Roblox } else { $null }
+  if ($rb -and [FHWin]::GetForegroundWindow() -eq $rb.MainWindowHandle) { $script:BackgroundAt = Get-Date }
+  foreach ($name in $states.Keys) {
+    $s = $states[$name]; $st=$s.state; $f=$s.features
+    if (-not $st) { continue }
+    if (-not $script:Watches.ContainsKey($name)) { $script:Watches[$name]=@{alerted=$false;stamp='';note=''} }
+    $w=$script:Watches[$name]
+    if ($w.stamp -ne [string]$st.t) { $w.alerted=$false;$w.stamp=[string]$st.t }
+    if ($f.watchdog -and $f.webhook -and $st.watch.armed -and -not $st.unloaded -and $s.age -ge $StallSec -and -not $w.alerted) {
+      $w.alerted=$true
+      $hook = Read-Json (Join-Path (Script-Dir $name) 'webhook.json')
+      if ($hook -and $hook.alert -ne $false -and $hook.url -match '^https://discord\.com/api/webhooks/\d+/[A-Za-z0-9_-]+$') {
+        $mention=if($hook.ping -eq 'everyone'){'@everyone'}elseif([string]$hook.ping -match '^\d+$'){'<@'+$hook.ping+'>'}else{''}
+        $json=ConvertTo-Json -Depth 8 -Compress -InputObject @{username=$name.ToLower();content=$mention;embeds=@(@{title=$name.ToLower()+' stopped responding';color=65793;description=([string]$st.watch.label).ToLower()+' - no state updates for '+[int]$s.age+' seconds'})}
+        $img=$null;if($hook.shot){$img=Take-Shot}
+        $r=Send-Discord 'POST' ($hook.url+'?wait=true') $json $img $false
+        $w.note='watchdog delivery: '+$r.status;Say ($name+' '+$w.note)
+      } else { $w.note='watchdog: no enabled webhook configured' }
+    }
+    $script:Notes[$name]=(@($w.note, $w.afkNote) | Where-Object {$_}) -join '; '
+    if (-not $f.afk -or $st.unloaded -or $s.age -ge 15 -or -not $rb) { continue }
+    $minutes=(Get-Config).afkMinutes
+    $generic=((Get-Date)-$script:BackgroundAt).TotalMinutes -ge $minutes
+    if (-not $st.afk.needFocus -and -not $generic) { continue }
+    if (((Get-Date)-$script:LastHelp).TotalSeconds -lt 60 -or [FHWin]::IdleMs() -lt 3000) { continue }
+    $h=$rb.MainWindowHandle;$prev=[FHWin]::GetForegroundWindow();$script:LastHelp=Get-Date
+    try {
+      if (-not [FHWin]::Focus($h)) {$w.afkNote='AFK: Windows refused focus';continue}
+      Start-Sleep -Milliseconds 300
+      if ([FHWin]::GetForegroundWindow() -ne $h) {continue}
+      [FHWin]::Tap(0x4F);Start-Sleep -Milliseconds 150
+      if ([FHWin]::GetForegroundWindow() -eq $h) {[FHWin]::Tap(0x49)}
+      Start-Sleep -Milliseconds 250
+      $script:BackgroundAt=Get-Date;$w.afkNote='AFK: O/I sent at '+(Get-Date -Format HH:mm:ss)
+    } finally { if ($prev -ne [IntPtr]::Zero -and $prev -ne $h) {[void][FHWin]::Focus($prev)} }
+  }
+}
+function Handle-Client($client) {
+  if (-not [Net.IPAddress]::IsLoopback($client.Client.RemoteEndPoint.Address)) { return }
+  $client.ReceiveTimeout=3000;$client.SendTimeout=3000;$stream=$client.GetStream()
+  $line=Read-Line $stream;if(-not $line){return}
+  $headers=@{};$bytes=0
+  while($true){$h=Read-Line $stream;if($null -eq $h -or $h -eq ''){break};$bytes+=$h.Length;if($bytes -gt 65536){throw 'headers too large'};$i=$h.IndexOf(':');if($i -gt 0){$key=$h.Substring(0,$i).Trim().ToLower();if($headers.ContainsKey($key)){throw 'duplicate header'};$headers[$key]=$h.Substring($i+1).Trim()}}
+  if($headers['expect'] -eq '100-continue'){$b=[Text.Encoding]::ASCII.GetBytes("HTTP/1.1 100 Continue`r`n`r`n");$stream.Write($b,0,$b.Length)}
+  $body=New-Object byte[] 0
+  if($headers['transfer-encoding'] -eq 'chunked') {
+    $ms=New-Object IO.MemoryStream
+    while($true){$l=Read-Line $stream;if($null -eq $l){throw 'incomplete chunk'};$n=[Convert]::ToInt32($l.Split(';')[0].Trim(),16);if($n -lt 0 -or $ms.Length+$n -gt 1048576){throw 'body too large'};if($n -eq 0){do{$trailer=Read-Line $stream;if($null -eq $trailer){throw 'incomplete trailer'}}while($trailer -ne '');break};$b=Read-Exact $stream $n;if($b.Length -ne $n){throw 'incomplete chunk'};$ms.Write($b,0,$b.Length);[void](Read-Line $stream)}
+    $body=$ms.ToArray()
+  } elseif($headers['content-length']){$n=[int]$headers['content-length'];if($n -lt 0 -or $n -gt 1048576){throw 'body too large'};$body=Read-Exact $stream $n;if($body.Length -ne $n){throw 'incomplete body'}}
+  if(-not (Is-Local $headers)){Reply $stream 403 @{error='localhost Host/Origin required'};return}
+  $p=$line.Split(' ');if($p.Length -ne 3){throw 'bad request'};$method=$p[0];$target=$p[1];$path=($target -split '\?')[0];$query=if($target.Contains('?')){$target.Substring($target.IndexOf('?')+1)}else{''}
+  if($method -eq 'GET' -and $path -eq '/'){Send $stream 200 'text/html; charset=utf-8' $HtmlBytes "X-Frame-Options: DENY`r`nReferrer-Policy: no-referrer`r`nContent-Security-Policy: default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' blob:; frame-ancestors 'none'`r`n";return}
+  if($method -eq 'GET' -and $path -eq '/ping'){Reply $stream 200 @{relay='fischhub-relay';helper='matcha-helper';version=$Version};return}
+  # Legacy FischHub relay keeps its exact public contract, with Host/Origin checks added before all POSTs.
+  if($method -eq 'POST' -and $path.StartsWith('/api/webhooks/')){Relay $stream $path $query $body;return}
+  if($path -notin @('/api/scripts','/api/state','/api/controls') -and -not (Has-Key $headers)){Reply $stream 403 @{error='helper token required'};return}
+  try {
+    $j=$null;if($body.Length){$j=[Text.Encoding]::UTF8.GetString($body)|ConvertFrom-Json}
+    if($method -eq 'GET') {
+      switch($path){
+        '/api/scripts' {Reply $stream 200 @{scripts=@(Get-Scripts|ForEach-Object{@{name=$_}});afkMinutes=(Get-Config).afkMinutes};return}
+        '/api/state' {$name=Query-Value $query 'script';$s=Script-State $name;if(-not $s.features.dashboard){$s.state=$null};Reply $stream 200 $s;return}
+        '/api/controls' {$name=Query-Value $query 'script';$s=Script-State $name;$ctl=if($s.features.dashboard){Read-Json (Join-Path (Script-Dir $name) 'controls.json')}else{@{controls=@();actions=@()}};Reply $stream 200 $ctl;return}
+        '/api/clipboard' {Add-Type -AssemblyName System.Windows.Forms;Reply $stream 200 @{text=[Windows.Forms.Clipboard]::GetText()};return}
+        '/api/shot' {$w=1280;$v=Query-Value $query 'w';if($v -match '^\d+$'){$w=[Math]::Max(320,[Math]::Min(1920,[int]$v))};$img=Take-Shot $w $false;if($img){Send $stream 200 'image/jpeg' $img}else{Reply $stream 200 @{why=$script:ShotWhy}};return}
+      }
+    } elseif($method -eq 'POST') {
+      switch($path){
+        '/api/cmd' {Add-UniversalCommand $stream $j;return}
+        '/api/config' {
+          $cfg=Get-Config
+          if($null -ne $j.afkMinutes){if($j.afkMinutes -lt 1 -or $j.afkMinutes -gt 120){throw 'AFK interval must be 1-120 minutes'};$cfg.afkMinutes=[double]$j.afkMinutes}
+          if($j.script){$name=[string]$j.script;[void](Script-Dir $name);$f=Features $name (Script-State $name).state;foreach($p in $j.features.PSObject.Properties){if($p.Name -notin @('dashboard','webhook','watchdog','afk','files') -or $p.Value -isnot [bool]){throw 'invalid feature switch'};$f[$p.Name]=$p.Value};$cfg.scripts[$name]=$f}
+          Write-Json $ConfigFile $cfg;Reply $stream 200 @{ok=$true};return
+        }
+        '/api/http' {Reply $stream 200 (Proxy-Http $j);return}
+        '/api/open' {$u=$null;if(-not [Uri]::TryCreate([string]$j.url,[UriKind]::Absolute,[ref]$u) -or $u.Scheme -notin @('http','https') -or $u.UserInfo){throw 'http/https URL required'};Start-Process -FilePath $u.AbsoluteUri;Reply $stream 200 @{ok=$true};return}
+        '/api/file' {if($j.script -and -not (Script-State $j.script).features.files){throw 'files feature is off'};if($j.text -isnot [string]){throw 'text required'};Safe-Write ([string]$j.path) $j.text;Reply $stream 200 @{ok=$true};return}
+        '/api/install-loader' {$src=Join-Path $Workspace 'INSUI\loader.lua';if(-not(Test-Path -LiteralPath $src)){throw 'INSUI/loader.lua missing'};Assert-NoLink $src;Safe-Write 'C:\matcha\autoexec\insui_loader.lua' ([IO.File]::ReadAllText($src));Reply $stream 200 @{ok=$true};return}
+      }
+    }
+    Reply $stream 404 @{error='unknown route or method'}
+  } catch { Reply $stream 400 @{error=$_.Exception.Message} }
+}
+$listener=New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback,$Port)
+try {$listener.Start()}catch{Write-Host 'Port 47210 is in use. Close the other helper first.';exit 1}
+try {
+  Assert-NoLink $Root
+  [void][IO.Directory]::CreateDirectory($ScriptsRoot)
+  [IO.File]::WriteAllText((Join-Path $Root 'token.txt'),$Token,$Utf8)
+  $HtmlBytes=[Text.Encoding]::UTF8.GetBytes($Html.Replace('__HELPER_TOKEN__',$Token))
+  $pending=New-Object Collections.ArrayList;$nextBeat=Get-Date;$nextTick=Get-Date
+  Write-Host 'Matcha helper - http://127.0.0.1:47210 - close this window to stop.'
+  if(-not $env:MATCHA_HELPER_NO_BROWSER){Start-Process "http://127.0.0.1:$Port/"}
+  while($true){
+    # An orphaned backend stops even if the tray host crashes or is force-closed.
+    if($env:MATCHA_HELPER_HOST_PID -and (Get-Date) -ge $nextTick) {
+      try {$owner=[Diagnostics.Process]::GetProcessById([int]$env:MATCHA_HELPER_HOST_PID)} catch {break}
+      try {if($owner.StartTime.ToUniversalTime().Ticks -ne [long]$env:MATCHA_HELPER_HOST_CREATED){break}} finally {$owner.Dispose()}
+    }
+    if((Get-Date) -ge $nextBeat){$nextBeat=(Get-Date).AddSeconds(2);Write-Json (Join-Path $Root 'helper.json') @{version=$Version;port=$Port;pid=$PID;beat=[DateTimeOffset]::UtcNow.ToUnixTimeSeconds();mode=$(if($script:ActiveNames.Count){'awake'}else{'sleeping'});active=@($script:ActiveNames)}}
+    while($listener.Pending()){[void]$pending.Add(@{c=$listener.AcceptTcpClient();at=Get-Date})}
+    for($i=$pending.Count-1;$i -ge 0;$i--){$p=$pending[$i];if($p.c.Available -gt 0){$pending.RemoveAt($i);try{Handle-Client $p.c}catch{Say 'request rejected' 'Yellow'}finally{$p.c.Close()}}elseif(((Get-Date)-$p.at).TotalSeconds -gt 5){$pending.RemoveAt($i);$p.c.Close()}}
+    if((Get-Date) -ge $nextTick){$nextTick=(Get-Date).AddSeconds($(if($script:ActiveNames.Count){1}else{2}));try{Universal-Tick}catch{Say 'helper tick failed' 'Yellow'}}
+    Start-Sleep -Milliseconds $(if($script:ActiveNames.Count){50}else{200})
+  }
+} finally {
+  $listener.Stop();foreach($p in $pending){$p.c.Close()}
+  Write-Json (Join-Path $Root 'helper.json') @{version=$Version;port=$Port;pid=$PID;beat=0}
+}
+
+===== install.ps1 =====
+# Matcha helper 1.2.0 per-user installer. Readable; no elevation or network downloads.
+[CmdletBinding()]
+param([switch]$Uninstall, [string]$Workspace, [int]$WaitPid = 0, [switch]$Tray, [switch]$Update, [switch]$NoStartup, [switch]$NoLaunch)
+$ErrorActionPreference = 'Stop'
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class MatchaFolders {
+ [DllImport("shell32.dll")] static extern int SHGetKnownFolderPath(ref Guid id,uint flags,IntPtr token,out IntPtr path);
+ public static string Get(string name) {
+  Guid id=new Guid(name); IntPtr ptr;
+  int hr=SHGetKnownFolderPath(ref id,0x00010000,IntPtr.Zero,out ptr);
+  if(hr!=0) Marshal.ThrowExceptionForHR(hr);
+  try{return Marshal.PtrToStringUni(ptr);}finally{Marshal.FreeCoTaskMem(ptr);}
+ }
+}
+'@
+$InstallRoot = [IO.Path]::GetFullPath((Join-Path ([MatchaFolders]::Get('F1B32785-6FBA-4FCF-9D55-7B8E7F157091')) 'matcha-helper'))
+$Exe = Join-Path $InstallRoot 'matcha-helper.exe'
+$Runner = Join-Path $InstallRoot 'run.ps1'
+$ShortcutPath = Join-Path ([MatchaFolders]::Get('B97D20BB-F46A-4C97-BA10-5E3608430854')) 'Matcha helper.lnk'
+$MenuPath = Join-Path ([MatchaFolders]::Get('A77F5D77-2E2B-44C3-A6A2-ABA601054A51')) 'Matcha helper.lnk'
+$PidFile = Join-Path $InstallRoot 'process.json'
+$Managed = @('matcha-helper.exe','source-code.txt','README.txt','install.ps1','process.json','workspace.txt','updates-disabled.txt','run.ps1','matcha-helper.bat',
+  'runtime\backend.ps1','runtime\source-code.txt','setup\matcha-helper.exe','setup\install.ps1','setup\source-code.txt','setup\README.txt')
+function Assert-Managed([string]$Path) {
+  $full = [IO.Path]::GetFullPath($Path)
+  if ($full -ne $InstallRoot -and -not $full.StartsWith($InstallRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'path outside helper installation' }
+  for ($p=$full; $p; $p=[IO.Path]::GetDirectoryName($p)) {
+    if ((Test-Path -LiteralPath $p) -and ((Get-Item -LiteralPath $p -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'linked installation paths are not supported' }
+  }
+}
+function Recycle([string]$Path) {
+  if (Test-Path -LiteralPath $Path) {
+    Add-Type -AssemblyName Microsoft.VisualBasic
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($Path,'OnlyErrorDialogs','SendToRecycleBin')
+  }
+}
+function Stop-Helper {
+  # process.json can be stale after portable/packaged launches. Verify the actual
+  # installed executable and its exact backend path, never a PID alone.
+  $hosts=@(Get-CimInstance Win32_Process -Filter "Name='matcha-helper.exe'" | Where-Object { $_.ExecutablePath -ieq $Exe })
+  foreach($hostProcess in $hosts) {
+    $hostId=[int]$hostProcess.ProcessId
+    $created=(Get-Process -Id $hostId -ErrorAction Stop).StartTime.ToUniversalTime().Ticks
+    $backendPath=Join-Path $InstallRoot 'runtime\backend.ps1'
+    $children=@(Get-CimInstance Win32_Process -Filter ('ParentProcessId='+$hostId) | Where-Object { $_.Name -ieq 'powershell.exe' -and $_.CommandLine -and $_.CommandLine.IndexOf('"'+$backendPath+'"',[StringComparison]::OrdinalIgnoreCase) -ge 0 })
+    Start-Process -FilePath $Exe -ArgumentList '--quit' -WindowStyle Hidden -Wait
+    try {Wait-Process -Id $hostId -Timeout 8 -ErrorAction Stop} catch {
+      $still=Get-Process -Id $hostId -ErrorAction SilentlyContinue
+      if($still -and $still.StartTime.ToUniversalTime().Ticks -eq $created){Stop-Process -Id $hostId}
+    }
+    foreach($child in $children) {
+      $still=Get-CimInstance Win32_Process -Filter ('ProcessId='+[int]$child.ProcessId) -ErrorAction SilentlyContinue
+      if($still -and $still.ParentProcessId -eq $hostId -and $still.CreationDate -eq $child.CreationDate -and $still.CommandLine -eq $child.CommandLine){Stop-Process -Id $still.ProcessId}
+    }
+  }
+  if (-not (Test-Path -LiteralPath $PidFile)) { return }
+  $saved = Get-Content -LiteralPath $PidFile -Raw | ConvertFrom-Json
+  $running = Get-CimInstance Win32_Process -Filter ('ProcessId=' + [int]$saved.pid) -ErrorAction SilentlyContinue
+  if (-not $running) { return }
+  if ($running.Name -ieq 'matcha-helper.exe' -and $running.ExecutablePath -ieq $Exe -and
+      (Get-Process -Id $running.ProcessId).StartTime.ToUniversalTime().Ticks -eq [long]$saved.created) {
+    Start-Process -FilePath $Exe -ArgumentList '--quit' -WindowStyle Hidden -Wait
+    try { Wait-Process -Id $running.ProcessId -Timeout 12 -ErrorAction Stop } catch {
+      $still = Get-Process -Id $running.ProcessId -ErrorAction SilentlyContinue
+      if ($still -and $still.StartTime.ToUniversalTime().Ticks -eq [long]$saved.created) { Stop-Process -Id $still.Id }
+    }
+  } elseif ($running.Name -ieq 'powershell.exe' -and $running.CommandLine -and
+      $running.CommandLine.IndexOf('"'+$Runner+'"',[StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+      $running.CreationDate.ToUniversalTime().Ticks -eq [long]$saved.created) {
+    Stop-Process -Id $running.ProcessId
+    $beatFile = Join-Path ([string]$saved.workspace) 'INSUI\helper\helper.json'
+    if (Test-Path -LiteralPath $beatFile) {
+      $beat = Get-Content -LiteralPath $beatFile -Raw | ConvertFrom-Json
+      if ([int]$beat.pid -eq [int]$saved.pid) { $beat.beat = 0; $beat | ConvertTo-Json -Compress | Set-Content -LiteralPath $beatFile -Encoding UTF8 }
+    }
+  }
+}
+Assert-Managed $InstallRoot
+foreach ($name in $Managed) { Assert-Managed (Join-Path $InstallRoot $name) }
+$shell = New-Object -ComObject WScript.Shell
+foreach($shortcut in @($ShortcutPath,$MenuPath)) {
+ if (Test-Path -LiteralPath $shortcut) {
+  $link = $shell.CreateShortcut($shortcut)
+  $ours = $link.TargetPath -ieq $Exe -or ($link.Arguments.IndexOf('"'+$Runner+'"',[StringComparison]::OrdinalIgnoreCase) -ge 0)
+  if (-not $ours) { throw 'shortcut belongs to another application' }
+ }
+}
+if ($Uninstall) {
+  if ($WaitPid -gt 0) { Wait-Process -Id $WaitPid -Timeout 30 -ErrorAction SilentlyContinue }
+  Stop-Helper
+  Recycle $ShortcutPath
+  Recycle $MenuPath
+  foreach ($name in $Managed) { Recycle (Join-Path $InstallRoot $name) }
+  foreach($name in @('matcha-helper.exe','source-code.txt','README.txt','install.ps1')) { Recycle (Join-Path $InstallRoot ($name+'.rollback')) }
+  Write-Output 'helper uninstalled; managed files recycled; script settings preserved'
+  return
+}
+if($Update){$NoStartup=-not (Test-Path -LiteralPath $ShortcutPath)}
+if(-not $Workspace){
+ $savedWorkspace=Join-Path $InstallRoot 'workspace.txt'
+ $Workspace=if(Test-Path -LiteralPath $savedWorkspace){[IO.File]::ReadAllText($savedWorkspace).Trim()}else{'C:\matcha\workspace'}
+}
+$Workspace = [IO.Path]::GetFullPath($Workspace)
+if (-not (Test-Path -LiteralPath $Workspace -PathType Container)) { throw 'Matcha workspace folder not found' }
+# Validate all required files before stopping the working helper.
+foreach ($name in @('matcha-helper.exe','source-code.txt','README.txt','install.ps1')) {
+  $src = Join-Path $PSScriptRoot $name
+  if (-not (Test-Path -LiteralPath $src)) { throw ('keep the package together: missing '+$name) }
+}
+$sums=Join-Path $PSScriptRoot 'SHA256SUMS.txt'
+if(Test-Path -LiteralPath $sums){
+ foreach($line in [IO.File]::ReadAllLines($sums)){
+  if($line -notmatch '^([a-f0-9]{64})  ([A-Za-z0-9_.-]+)$'){throw 'invalid package checksum list'}
+  $expected=$Matches[1]; $file=Join-Path $PSScriptRoot $Matches[2]
+  if((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLower() -ne $expected){throw 'package checksum mismatch'}
+ }
+}
+if ($WaitPid -gt 0) { Wait-Process -Id $WaitPid -Timeout 30 -ErrorAction SilentlyContinue }
+Stop-Helper
+if (Get-NetTCPConnection -LocalPort 47210 -State Listen -ErrorAction SilentlyContinue) { throw 'another helper is running; quit it before installing' }
+[void][IO.Directory]::CreateDirectory($InstallRoot)
+$copied=@(); $backed=@()
+try {
+ foreach ($name in @('matcha-helper.exe','source-code.txt','README.txt','install.ps1')) {
+  $src=Join-Path $PSScriptRoot $name; $dst=Join-Path $InstallRoot $name
+  if ([IO.Path]::GetFullPath($src) -eq $dst){continue}
+  $backup=$dst+'.rollback'; Assert-Managed $backup
+  if(Test-Path -LiteralPath $dst){Copy-Item -LiteralPath $dst -Destination $backup -Force; $backed+=$name}
+  Copy-Item -LiteralPath $src -Destination $dst -Force; $copied+=$name
+ }
+} catch {
+ foreach($name in $backed){Copy-Item -LiteralPath (Join-Path $InstallRoot ($name+'.rollback')) -Destination (Join-Path $InstallRoot $name) -Force}
+ foreach($name in $copied){if($name -notin $backed){Recycle (Join-Path $InstallRoot $name)}}
+ if(Test-Path -LiteralPath $Exe){Start-Process -FilePath $Exe -ArgumentList '--tray' -WindowStyle Hidden}
+ throw
+}
+[IO.File]::WriteAllText((Join-Path $InstallRoot 'workspace.txt'),$Workspace)
+# Recycle superseded launcher files; never remove unfamiliar files or script data.
+foreach ($name in @('run.ps1','matcha-helper.bat')) { Recycle (Join-Path $InstallRoot $name) }
+foreach($shortcut in @($MenuPath,$ShortcutPath)) {
+ if($shortcut -eq $ShortcutPath -and $NoStartup){Recycle $ShortcutPath; continue}
+ [void][IO.Directory]::CreateDirectory((Split-Path $shortcut))
+ $link = $shell.CreateShortcut($shortcut)
+ $link.TargetPath=$Exe; $link.Arguments=if($shortcut -eq $ShortcutPath){'--tray'}else{''}; $link.WorkingDirectory=$InstallRoot; $link.IconLocation=$Exe+',0'; $link.WindowStyle=7
+ $link.Description='Matcha helper; sleeps until a script is active; quit from the tray'; $link.Save()
+}
+foreach($name in $backed){Recycle (Join-Path $InstallRoot ($name+'.rollback'))}
+if(-not $NoLaunch){
+ if ($Tray) { Start-Process -FilePath $Exe -ArgumentList '--tray' -WindowStyle Hidden }
+ else { Start-Process -FilePath $Exe -WindowStyle Hidden }
+}
+Write-Output 'native helper installed; Start menu shortcut created; preferences preserved on update'
+
+===== build.ps1 =====
+# Build the native tray EXE using Windows' .NET Framework compiler. No downloads.
+[CmdletBinding()]
+param([string]$Out)
+$ErrorActionPreference='Stop'
+if(-not $Out){$Out=Join-Path $PSScriptRoot 'package'}
+$Out=[IO.Path]::GetFullPath($Out)
+[void][IO.Directory]::CreateDirectory($Out)
+$Compiler=Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+$Framework=Split-Path $Compiler
+$Source=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'MatchaHelper.cs'))
+$Backend=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'backend.ps1'))
+$Installer=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'install.ps1'))
+$Build=[IO.File]::ReadAllText($PSCommandPath)
+$Readable="MATCHA HELPER 1.2.0 - COMPLETE SOURCE`r`n"
+foreach($name in @('MatchaHelper.cs','Updater.cs','Installer.cs','backend.ps1','install.ps1','build.ps1','sign-release.ps1','publish.ps1','update-public-key.xml')) {
+ $Readable+="`r`n===== $name =====`r`n"+[IO.File]::ReadAllText((Join-Path $PSScriptRoot $name))
+}
+[IO.File]::WriteAllText((Join-Path $Out 'source-code.txt'),$Readable,[Text.UTF8Encoding]::new($false))
+[IO.File]::WriteAllText((Join-Path $PSScriptRoot 'source-code.txt'),$Readable,[Text.UTF8Encoding]::new($false))
+Add-Type -AssemblyName System.Drawing
+$Bitmap=[Drawing.Bitmap]::new(32,32); $Graphics=[Drawing.Graphics]::FromImage($Bitmap)
+$Graphics.SmoothingMode='AntiAlias'; $Brush=[Drawing.SolidBrush]::new([Drawing.Color]::FromArgb(160,225,193))
+$Graphics.FillEllipse($Brush,3,12,24,15)
+$Graphics.FillPolygon($Brush,[Drawing.Point[]]@([Drawing.Point]::new(24,20),[Drawing.Point]::new(29,7),[Drawing.Point]::new(31,13),[Drawing.Point]::new(29,23)))
+$Graphics.FillRectangle($Brush,11,6,2,7); $Graphics.FillEllipse($Brush,8,4,5,3); $Graphics.FillEllipse($Brush,13,3,5,3)
+$Eye=[Drawing.SolidBrush]::new([Drawing.Color]::FromArgb(14,18,16)); $Graphics.FillEllipse($Eye,8,17,3,3)
+$Icon=[Drawing.Icon]::FromHandle($Bitmap.GetHicon()); $File=[IO.File]::Create((Join-Path $Out 'matcha.ico')); $Icon.Save($File); $File.Close()
+$Graphics.Dispose(); $Bitmap.Dispose(); $Brush.Dispose(); $Eye.Dispose(); $Icon.Dispose()
+& $Compiler /nologo /target:winexe /optimize+ /platform:anycpu "/out:$Out\matcha-helper.exe" "/win32icon:$Out\matcha.ico" "/reference:$Framework\System.Windows.Forms.dll" "/reference:$Framework\System.Drawing.dll" "/reference:$Framework\System.Web.Extensions.dll" "/reference:$Framework\Microsoft.VisualBasic.dll" "/reference:$Framework\System.IO.Compression.dll" "/resource:$PSScriptRoot\backend.ps1,Backend" "/resource:$Out\source-code.txt,Source" "/resource:$PSScriptRoot\install.ps1,Installer" "/resource:$PSScriptRoot\README.txt,Readme" "/resource:$PSScriptRoot\update-public-key.xml,UpdateKey" "$PSScriptRoot\MatchaHelper.cs" "$PSScriptRoot\Updater.cs"
+if($LASTEXITCODE -ne 0){throw 'native compilation failed'}
+& $Compiler /nologo /target:winexe /optimize+ /platform:anycpu "/out:$Out\installer.exe" "/win32icon:$Out\matcha.ico" "/reference:$Framework\System.Windows.Forms.dll" "/reference:$Framework\System.Drawing.dll" "/resource:$Out\matcha-helper.exe,HelperBinary" "/resource:$Out\source-code.txt,Source" "/resource:$PSScriptRoot\install.ps1,Installer" "/resource:$PSScriptRoot\README.txt,Readme" "/resource:$Out\matcha.ico,Icon" "$PSScriptRoot\Installer.cs"
+if($LASTEXITCODE -ne 0){throw 'installer compilation failed'}
+foreach($name in @('README.txt','install.ps1','MatchaHelper.cs','Updater.cs','Installer.cs','backend.ps1','build.ps1','sign-release.ps1','publish.ps1','update-public-key.xml')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $Out $name) -Force }
+[IO.File]::WriteAllText((Join-Path $Out 'uninstall.cmd'),"@echo off`r`npowershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0install.ps1`" -Uninstall`r`npause`r`n")
+$Hashes=Get-ChildItem -LiteralPath $Out -File | Where-Object Name -ne 'SHA256SUMS.txt' | Sort-Object Name | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLower()+'  '+$_.Name }
+[IO.File]::WriteAllLines((Join-Path $Out 'SHA256SUMS.txt'),$Hashes)
+Write-Output ('built helper and single-file installer in '+$Out)
+
+===== sign-release.ps1 =====
+# Keep the signing key outside Git, protected by Windows DPAPI for the owner account.
+[CmdletBinding()]
+param([switch]$Initialize, [string]$ReleaseDirectory)
+$ErrorActionPreference='Stop'
+if(-not $ReleaseDirectory){$ReleaseDirectory=Join-Path $PSScriptRoot 'release'}
+Add-Type -AssemblyName System.Security
+$KeyPath=Join-Path $env:USERPROFILE '.j5cks\matcha-helper-signing.dpapi'
+$PublicPath=Join-Path $PSScriptRoot 'update-public-key.xml'
+$RSA=[Security.Cryptography.RSACryptoServiceProvider]::new(3072)
+$RSA.PersistKeyInCsp=$false
+try {
+ if(Test-Path -LiteralPath $KeyPath) {
+  $plain=[Security.Cryptography.ProtectedData]::Unprotect([IO.File]::ReadAllBytes($KeyPath),$null,[Security.Cryptography.DataProtectionScope]::CurrentUser)
+  $RSA.FromXmlString([Text.Encoding]::UTF8.GetString($plain)); [Array]::Clear($plain,0,$plain.Length)
+ } elseif($Initialize) {
+  [void][IO.Directory]::CreateDirectory((Split-Path $KeyPath))
+  $plain=[Text.Encoding]::UTF8.GetBytes($RSA.ToXmlString($true))
+  $protected=[Security.Cryptography.ProtectedData]::Protect($plain,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser)
+  [IO.File]::WriteAllBytes($KeyPath,$protected); [Array]::Clear($plain,0,$plain.Length)
+ } else {throw 'Signing key missing. Initialize it once under the owner Windows account.'}
+ $public=$RSA.ToXmlString($false)
+ if(Test-Path -LiteralPath $PublicPath) {
+  if([IO.File]::ReadAllText($PublicPath).Trim() -ne $public){throw 'Signing key does not match the pinned public key. Refusing key replacement.'}
+ } elseif($Initialize){[IO.File]::WriteAllText($PublicPath,$public,[Text.UTF8Encoding]::new($false))}
+ else {throw 'Pinned public key missing'}
+ if($Initialize){Write-Output 'Signing key initialized privately; only the public key is in source.'; return}
+ $Manifest=Join-Path $ReleaseDirectory 'update.json'
+ $bytes=[IO.File]::ReadAllBytes($Manifest)
+ $sig=$RSA.SignData($bytes,'SHA256')
+ [IO.File]::WriteAllText((Join-Path $ReleaseDirectory 'update.sig'),[Convert]::ToBase64String($sig),[Text.UTF8Encoding]::new($false))
+ Write-Output 'Release manifest signed.'
+} finally {$RSA.Dispose()}
+
+===== publish.ps1 =====
+# Builds and signs locally. -Publish is only used with owner release authorization.
+[CmdletBinding()]
+param([switch]$Publish)
+$ErrorActionPreference='Stop'
+$version='1.2.0'
+& (Join-Path $PSScriptRoot 'build.ps1')
+$release=Join-Path $PSScriptRoot 'release'
+[void][IO.Directory]::CreateDirectory($release)
+$zip=Join-Path $release 'matcha-helper.zip'
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+if(Test-Path -LiteralPath $zip){
+ Add-Type -AssemblyName Microsoft.VisualBasic
+ [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($zip,'OnlyErrorDialogs','SendToRecycleBin')
+}
+[IO.Compression.ZipFile]::CreateFromDirectory((Join-Path $PSScriptRoot 'package'),$zip)
+$manifest=[ordered]@{schema=1;version=$version;package='matcha-helper.zip';size=(Get-Item -LiteralPath $zip).Length;sha256=(Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower();expires=[DateTimeOffset]::UtcNow.AddDays(365).ToUnixTimeSeconds()}
+[IO.File]::WriteAllText((Join-Path $release 'update.json'),($manifest|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+& (Join-Path $PSScriptRoot 'sign-release.ps1') -ReleaseDirectory $release
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'package\installer.exe') -Destination (Join-Path $release 'installer.exe') -Force
+& (Join-Path $PSScriptRoot 'tests\run.ps1')
+if(-not $Publish){Write-Output 'Signed local candidates ready. Nothing published.';return}
+# Refuse accidental release under a different account or with unrelated staged data.
+if((gh api user --jq .login) -ne 'adorablewhale'){throw 'GitHub must be signed into adorablewhale'}
+function Invoke-HelperGit { & git.exe -c ('safe.directory='+$PSScriptRoot.Replace('\','/')) -C $PSScriptRoot @args }
+if(-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot '.git'))){
+ Invoke-HelperGit init -b main
+ Invoke-HelperGit remote add origin https://github.com/adorablewhale/matcha-helper.git
+}
+$staged=Invoke-HelperGit diff --cached --name-only
+if($staged){throw 'Review existing staged files before publishing'}
+Invoke-HelperGit add -- .gitignore README.txt source-code.txt MatchaHelper.cs Updater.cs Installer.cs backend.ps1 install.ps1 build.ps1 sign-release.ps1 publish.ps1 update-public-key.xml tests
+if($LASTEXITCODE -ne 0){throw 'Staging failed'}
+Invoke-HelperGit diff --cached --quiet
+if($LASTEXITCODE -eq 1){Invoke-HelperGit commit -m "Release Matcha helper $version with signed updates and installer";if($LASTEXITCODE -ne 0){throw 'Commit failed'}}
+Invoke-HelperGit push -u origin main
+if($LASTEXITCODE -ne 0){throw 'Source push failed'}
+gh release create "v$version" --repo adorablewhale/matcha-helper --title "Matcha helper $version" --notes-file (Join-Path $PSScriptRoot 'README.txt') --latest (Join-Path $release 'installer.exe') $zip (Join-Path $release 'update.json') (Join-Path $release 'update.sig')
+if($LASTEXITCODE -ne 0){throw 'Release publication failed; do not overwrite an existing release'}
+
+===== update-public-key.xml =====
+<RSAKeyValue><Modulus>vv53NlraSwAQHQWMr0rsOK2657rgqVwJorHZLBU9/qPT40pJDDKslikShLclTjgiXs2vhhhRwmTeDplTU2KiVzQn+qkIHkKa/OkjUOPEhHf6HeRwobtc68tSjeLp4CVim2JaYtv9xO9JngvfPZ31a9Xqf72/vwex6VSckzcY2VUXCVurC98pA8TmpmRTZZBmXtqZE70gnvBGakJ665voWdAfEeB1USXvn3jz0zbaktCeeMBuLi122OK9LS6ztB081JkH2mqfzDaCpjhyaDOGNvWgOUDkyAkb//cGKL9G7AoT78WgrrNhCph16vMTvOY3+fuJ4f/OM2H7FaVvngRxiQbZzAcFDiXPtMRWCelOjbZvN5GQUv7rxeJiud1m8hKMWBZEUA5FMgUzodrHb6Vbluac/THpCjmXVyq9u2iXCFgUSsLQFsA2ym43I0Y0VPXNPfzrjYjwyEcBjNI3+cRAgfXhm8s2dWB3io+kfWUS8v4qgkK0XxsLzmQc5NBTpJYZ</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>
