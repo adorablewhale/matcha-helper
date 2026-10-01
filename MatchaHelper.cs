@@ -1,4 +1,4 @@
-// Matcha helper 1.3.0. Readable native host with signed, idle-only GitHub updates.
+// Matcha helper 1.3.1. Readable native host with signed, idle-only GitHub updates.
 // No obfuscation, elevation or telemetry. Update verification is in Updater.cs.
 using System;
 using System.Collections.Generic;
@@ -17,8 +17,8 @@ using System.Web.Script.Serialization;
 using System.Windows.Forms;
 [assembly: AssemblyTitle("Matcha helper")]
 [assembly: AssemblyDescription("Optional local Windows features for Matcha scripts")]
-[assembly: AssemblyVersion("1.3.0.0")]
-[assembly: AssemblyFileVersion("1.3.0.0")]
+[assembly: AssemblyVersion("1.3.1.0")]
+[assembly: AssemblyFileVersion("1.3.1.0")]
 
 static class Program {
     internal static readonly string Root = Path.Combine(KnownFolder("F1B32785-6FBA-4FCF-9D55-7B8E7F157091"), "matcha-helper");
@@ -147,7 +147,7 @@ sealed class HelperWindow : Form {
         updates = new CheckBox {Text = "automatically update from signed GitHub releases", Location = new Point(30,620), Size = new Size(460,28), Checked = !File.Exists(Path.Combine(Program.Root,"updates-disabled.txt")), Visible = installed};
         updates.CheckedChanged += delegate { if (!initializing) { Program.Write(Path.Combine(Program.Root,"updates-disabled.txt"),updates.Checked ? "enabled" : "disabled"); if (updates.Checked) nextCheck = DateTime.UtcNow; } }; Controls.Add(updates);
         if (File.Exists(Path.Combine(Program.Root,"updates-disabled.txt"))) updates.Checked = File.ReadAllText(Path.Combine(Program.Root,"updates-disabled.txt")).Trim() != "disabled";
-        updateLabel = LabelAt("v1.3.0 · updates apply only while sleeping",30,660,330,35,9,Muted);
+        updateLabel = LabelAt("v1.3.1 · updates apply only while sleeping",30,660,330,35,9,Muted);
         if (installed) ButtonAt("check updates",366,659,124,delegate { CheckUpdates(true); },false);
     }
     protected override void OnPaint(PaintEventArgs e) {
@@ -286,7 +286,7 @@ sealed class HelperWindow : Form {
         if (pendingStage != null) { requestedUpdate |= manual; updateLabel.Text = "update ready · waiting for scripts to sleep"; return; }
         checking = true; requestedUpdate = manual; nextCheck = DateTime.UtcNow.AddHours(4); updateLabel.Text = "checking signed GitHub releases…";
         Task.Run(delegate {
-            string stage = null, message = "v1.3.0 · up to date";
+            string stage = null, message = "v1.3.1 · up to date";
             try {
                 var candidate = HelperUpdater.Check(Assembly.GetExecutingAssembly().GetName().Version, Program.Resource("UpdateKey"));
                 if (candidate != null) { stage = HelperUpdater.Stage(candidate,HelperUpdater.Download(candidate.Url,HelperUpdater.MaxPackage)); message = "v"+candidate.Manifest.version+" ready · waiting for sleep"; }

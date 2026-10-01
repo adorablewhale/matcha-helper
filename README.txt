@@ -1,4 +1,4 @@
-MATCHA HELPER 1.3.0
+MATCHA HELPER 1.3.1
 
 Download and open installer.exe, then choose "install and open". No unzip step or administrator rights.
 Choose whether it starts at login. Search "Matcha helper" in Windows to open it again.
@@ -32,7 +32,7 @@ capture the Roblox window. The helper uses localhost port 47210 and a local toke
 It does not upload usage tracking, credentials, school data or hardware IDs.
 Cloud dashboards and reporting are controlled separately in the scripts.
 
-Version 1.3.0 can upload a requested Roblox-window screenshot to the fixed
+Version 1.3.1 can upload a requested Roblox-window screenshot to the fixed
 adorablewhale.world dashboard, for the stats message or your Discord /screenshot
 reply. The installation key comes from the local script and is not logged or saved
 by this operation. It does not capture your desktop or other programs; if safe
@@ -44,6 +44,13 @@ Use "auto rejoin after a kick" in the helper window or tray menu to change the
 active script's setting. It stays in sync with the script, website and Discord.
 The switch is disabled when no supported script is active or local controls are
 off. It does not save or upload your private server link.
+Without a private server link, a rejoin goes to any public server of the same game.
+Matcha closes with Roblox, so after a rejoin the helper starts Matcha again: while a
+script is live it notes which Matcha app.exe is running (usermode or kernel) in
+matcha.json, and about 20 seconds after the new Roblox window appears it starts
+that same file if Matcha isn't already running. Matcha's own autoexec then loads
+your scripts. A kernel Matcha that needs administrator rights can't be started
+silently; start it yourself in that case.
 
 source-code.txt contains the complete C# app/updater/installer, PowerShell backend,
 installer/build/publish tools, and public verification key. The private signing key

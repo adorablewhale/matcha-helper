@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$Version = '1.3.0'
+$Version = '1.3.1'
 $Port = 47210
 $StallSec = 120
 $Workspace = 'C:\matcha\workspace'
@@ -382,6 +382,58 @@ function Read-Map($path) {
   if ($j) { foreach ($p in $j.PSObject.Properties) { $m[$p.Name] = $p.Value } }
   return $m
 }
+# ---- Matcha relaunch after a rejoin ---------------------------------------------------------------
+# Matcha's binaries are packed (no version info, no readable strings), so it is recognised by how it
+# runs: app.exe / loader.exe whose folder holds Matcha's imgui.ini or whose path says matcha, plus the
+# process serving Matcha's MCP port if any. The path is learned while a script is live (so Matcha is
+# certainly running) and saved, so a rejoin can start the same Matcha again once Roblox is back.
+$MatchaFile = Join-Path $Root 'matcha.json'
+$script:MatchaSeenAt = [datetime]::MinValue
+$script:MatchaRelaunch = $null
+function Find-Matcha {
+  $mcp = $null
+  try { $mcp = Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction Stop | Select-Object -First 1 -ExpandProperty OwningProcess } catch {}
+  $best = $null
+  foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='app.exe' OR Name='loader.exe' OR Name='matcha.exe'" -ErrorAction SilentlyContinue)) {
+    $path = [string]$p.ExecutablePath
+    if (-not $path) { continue }   # an elevated (kernel) Matcha hides its path from this non-admin helper
+    $score = 0
+    if ($path -match '(?i)matcha') { $score += 2 }
+    if (Test-Path -LiteralPath (Join-Path (Split-Path $path) 'imgui.ini')) { $score += 1 }
+    if ($mcp -and [int]$p.ProcessId -eq [int]$mcp) { $score += 3 }
+    if ($score -ge 2 -and (-not $best -or $score -gt $best.score)) { $best = @{path=$path; score=$score; pid=[int]$p.ProcessId} }
+  }
+  if (-not $best) { return $null }
+  $dir = Split-Path $best.path
+  $mode = if ($best.path -match '(?i)\\usermode\\') { 'usermode' } elseif (Test-Path -LiteralPath (Join-Path $dir 'map.exe')) { 'kernel' } else { 'unknown' }
+  return @{path=$best.path; mode=$mode; pid=$best.pid}
+}
+function Remember-Matcha {
+  if (((Get-Date) - $script:MatchaSeenAt).TotalSeconds -lt 60) { return }
+  $script:MatchaSeenAt = Get-Date
+  $m = Find-Matcha
+  if ($m) { Write-Json $MatchaFile @{path=$m.path; mode=$m.mode; seen=[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()} }
+}
+function Saved-Matcha {
+  $m = Find-Matcha
+  if ($m) { return $m }
+  $saved = Read-Json $MatchaFile
+  if ($saved -and $saved.path -and (Test-Path -LiteralPath ([string]$saved.path))) { return @{path=[string]$saved.path; mode=[string]$saved.mode} }
+  return $null
+}
+# One step per main-loop tick: wait for the new Roblox window, give the game time to load, then start Matcha.
+function Relaunch-Step {
+  $r = $script:MatchaRelaunch
+  if (-not $r) { return }
+  if ((Get-Date) -gt $r.deadline) { $script:MatchaRelaunch = $null; Say 'matcha relaunch gave up: roblox did not come back' 'Yellow'; return }
+  if (-not (Get-Roblox)) { $r.robloxAt = $null; return }
+  if (-not $r.robloxAt) { $r.robloxAt = Get-Date; return }
+  if (((Get-Date) - $r.robloxAt).TotalSeconds -lt 20) { return }
+  $script:MatchaRelaunch = $null
+  if (Find-Matcha) { Say 'matcha is already running' 'Gray'; return }
+  try { Start-Process -FilePath $r.path -WorkingDirectory (Split-Path $r.path); Say ('started matcha again (' + $r.mode + ')') 'Cyan' }
+  catch { Say ('could not start matcha (' + $r.mode + '): ' + $_.Exception.Message) 'Yellow' }
+}
 function Get-Config {
   $c = Read-Map $ConfigFile
   $s = @{}
@@ -511,6 +563,7 @@ function Universal-Tick {
       if ($state.features.afk) { $needsRoblox = $true }
     }
   }
+  if ($script:ActiveNames.Count) { try { Remember-Matcha } catch {} }
   # No process scan, focus, keyboard input or automatic screenshot while sleeping.
   $rb = if ($needsRoblox) { Get-Roblox } else { $null }
   if ($rb -and [FHWin]::GetForegroundWindow() -eq $rb.MainWindowHandle) { $script:BackgroundAt = Get-Date }
@@ -608,12 +661,14 @@ function Handle-Client($client) {
           elseif([string]$j.shareCode -match '^[A-Za-z0-9_-]{8,80}$'){$uri='roblox://navigation/share_links?code='+$j.shareCode+'&type=Server'}
           elseif([string]$j.placeId -match '^\d{1,20}$'){$uri='roblox://experiences/start?placeId='+$j.placeId}   # no link: any public server
           else{throw 'a place id or private server link code is required'}
+          $m=Saved-Matcha
+          if($m){$script:MatchaRelaunch=@{path=[string]$m.path;mode=[string]$m.mode;deadline=(Get-Date).AddMinutes(4);robloxAt=$null}}
           # close the kicked client first so the relaunch starts clean
           Get-Process RobloxPlayerBeta -ErrorAction SilentlyContinue|ForEach-Object{try{[void]$_.CloseMainWindow();if(-not $_.WaitForExit(4000)){$_.Kill()}}catch{}}
           Start-Sleep -Milliseconds 1500
           Start-Process -FilePath $uri
           Say 'rejoining the private server' 'Cyan'
-          Reply $stream 200 @{ok=$true};return
+          Reply $stream 200 @{ok=$true;matcha=$(if($m){[string]$m.mode}else{'not found - start matcha yourself'})};return
         }
         '/api/http' {Reply $stream 200 (Proxy-Http $j);return}
         '/api/open' {$u=$null;if(-not [Uri]::TryCreate([string]$j.url,[UriKind]::Absolute,[ref]$u) -or $u.Scheme -notin @('http','https') -or $u.UserInfo){throw 'http/https URL required'};Start-Process -FilePath $u.AbsoluteUri;Reply $stream 200 @{ok=$true};return}
@@ -643,7 +698,7 @@ try {
     if((Get-Date) -ge $nextBeat){$nextBeat=(Get-Date).AddSeconds(2);Write-Json (Join-Path $Root 'helper.json') @{version=$Version;port=$Port;pid=$PID;beat=[DateTimeOffset]::UtcNow.ToUnixTimeSeconds();mode=$(if($script:ActiveNames.Count){'awake'}else{'sleeping'});active=@($script:ActiveNames)}}
     while($listener.Pending()){[void]$pending.Add(@{c=$listener.AcceptTcpClient();at=Get-Date})}
     for($i=$pending.Count-1;$i -ge 0;$i--){$p=$pending[$i];if($p.c.Available -gt 0){$pending.RemoveAt($i);try{Handle-Client $p.c}catch{Say 'request rejected' 'Yellow'}finally{$p.c.Close()}}elseif(((Get-Date)-$p.at).TotalSeconds -gt 5){$pending.RemoveAt($i);$p.c.Close()}}
-    if((Get-Date) -ge $nextTick){$nextTick=(Get-Date).AddSeconds($(if($script:ActiveNames.Count){1}else{2}));try{Universal-Tick}catch{Say 'helper tick failed' 'Yellow'}}
+    if((Get-Date) -ge $nextTick){$nextTick=(Get-Date).AddSeconds($(if($script:ActiveNames.Count){1}else{2}));try{Universal-Tick}catch{Say 'helper tick failed' 'Yellow'};try{Relaunch-Step}catch{Say 'matcha relaunch failed' 'Yellow'}}
     Start-Sleep -Milliseconds $(if($script:ActiveNames.Count){50}else{200})
   }
 } finally {

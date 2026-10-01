@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([switch]$Publish)
 $ErrorActionPreference='Stop'
-$version='1.3.0'
+$version='1.3.1'
 & (Join-Path $PSScriptRoot 'build.ps1')
 $release=Join-Path $PSScriptRoot 'release'
 [void][IO.Directory]::CreateDirectory($release)

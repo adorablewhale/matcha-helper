@@ -8,15 +8,15 @@
 
 [download the installer](https://github.com/adorablewhale/matcha-helper/releases/latest)
 
-**new in 1.3.0:** roblox screenshots on your discord stats message, auto rejoin after a kick
-(your private server, or any public one), and an auto rejoin switch in the window and tray.
+**new in 1.3:** roblox screenshots on your discord stats message, auto rejoin after a kick
+(your private server, or any public one) that starts matcha again for you, and an auto rejoin switch.
 
 </div>
 
 ### what it does
 
 - **screenshots, focus, clipboard and files** for scripts that ask for them
-- **auto rejoin** after a kick, back into your private server or any public one
+- **auto rejoin** after a kick: back into your server, then it starts matcha again (usermode or kernel)
 - **sleeps when no script is running** — no input, no screenshots, nothing
 - **lives in the tray** — double-click the whale for status, right-click to pause or quit
 - **updates itself** safely — signed releases only, applied while it's asleep
