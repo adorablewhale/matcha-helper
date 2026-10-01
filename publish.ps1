@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([switch]$Publish)
 $ErrorActionPreference='Stop'
-$version='1.2.0'
+$version='1.3.0'
 & (Join-Path $PSScriptRoot 'build.ps1')
 $release=Join-Path $PSScriptRoot 'release'
 [void][IO.Directory]::CreateDirectory($release)
@@ -28,7 +28,7 @@ if(-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot '.git'))){
 }
 $staged=Invoke-HelperGit diff --cached --name-only
 if($staged){throw 'Review existing staged files before publishing'}
-Invoke-HelperGit add -- .gitignore README.txt source-code.txt MatchaHelper.cs Updater.cs Installer.cs backend.ps1 install.ps1 build.ps1 sign-release.ps1 publish.ps1 update-public-key.xml tests
+Invoke-HelperGit add -- .gitignore README.md README.txt source-code.txt MatchaHelper.cs Updater.cs Installer.cs backend.ps1 install.ps1 build.ps1 sign-release.ps1 publish.ps1 update-public-key.xml tests
 if($LASTEXITCODE -ne 0){throw 'Staging failed'}
 Invoke-HelperGit diff --cached --quiet
 if($LASTEXITCODE -eq 1){Invoke-HelperGit commit -m "Release Matcha helper $version with signed updates and installer";if($LASTEXITCODE -ne 0){throw 'Commit failed'}}

@@ -8,8 +8,8 @@ using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 [assembly: AssemblyTitle("Matcha helper installer")]
-[assembly: AssemblyVersion("1.2.0.0")]
-[assembly: AssemblyFileVersion("1.2.0.0")]
+[assembly: AssemblyVersion("1.3.0.0")]
+[assembly: AssemblyFileVersion("1.3.0.0")]
 static class InstallerMain {
     [DllImport("shell32.dll")] static extern int SHGetKnownFolderPath(ref Guid id,uint flags,IntPtr token,out IntPtr path);
     internal static string Folder(string name) {
@@ -67,7 +67,7 @@ sealed class InstallerWindow:Form {
             try {await Task.Run(delegate {InstallerMain.Install(folder,login,false);});status.Text="installed · ready in your tray";install.Text="installed";}
             catch(Exception e){status.Text="setup needs attention";install.Enabled=true;MessageBox.Show(this,e.Message,"Matcha helper setup");}
         },true);
-        status=LabelAt("v1.2.0 · windows 10 / 11",274,397,245,35,9);
+        status=LabelAt("v1.3.0 · windows 10 / 11",274,397,245,35,9);
     }
     Label LabelAt(string text,int x,int y,int w,int h,float size){var l=new Label {Text=text,Location=new Point(x,y),Size=new Size(w,h),Font=new Font("Segoe UI",size),ForeColor=ink};Controls.Add(l);return l;}
     Button ButtonAt(string text,int x,int y,int width,EventHandler click,bool primary){var b=new Button {Text=text,Location=new Point(x,y),Size=new Size(width,38),FlatStyle=FlatStyle.Flat,BackColor=primary?mint:Color.FromArgb(23,29,26),ForeColor=primary?Color.FromArgb(14,18,16):ink};b.FlatAppearance.BorderSize=primary?0:1;b.Click+=click;Controls.Add(b);return b;}

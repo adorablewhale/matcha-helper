@@ -11,7 +11,7 @@ $Source=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'MatchaHelper.cs'))
 $Backend=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'backend.ps1'))
 $Installer=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'install.ps1'))
 $Build=[IO.File]::ReadAllText($PSCommandPath)
-$Readable="MATCHA HELPER 1.2.0 - COMPLETE SOURCE`r`n"
+$Readable="MATCHA HELPER 1.3.0 - COMPLETE SOURCE`r`n"
 foreach($name in @('MatchaHelper.cs','Updater.cs','Installer.cs','backend.ps1','install.ps1','build.ps1','sign-release.ps1','publish.ps1','update-public-key.xml')) {
  $Readable+="`r`n===== $name =====`r`n"+[IO.File]::ReadAllText((Join-Path $PSScriptRoot $name))
 }

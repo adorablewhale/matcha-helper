@@ -1,4 +1,4 @@
-MATCHA HELPER 1.2.0
+MATCHA HELPER 1.3.0
 
 Download and open installer.exe, then choose "install and open". No unzip step or administrator rights.
 Choose whether it starts at login. Search "Matcha helper" in Windows to open it again.
@@ -31,6 +31,19 @@ Only the features enabled in your script/helper settings are used. Screenshots
 capture the Roblox window. The helper uses localhost port 47210 and a local token.
 It does not upload usage tracking, credentials, school data or hardware IDs.
 Cloud dashboards and reporting are controlled separately in the scripts.
+
+Version 1.3.0 can upload a requested Roblox-window screenshot to the fixed
+adorablewhale.world dashboard, for the stats message or your Discord /screenshot
+reply. The installation key comes from the local script and is not logged or saved
+by this operation. It does not capture your desktop or other programs; if safe
+capture is unavailable, it reports why. No caller-chosen upload address is allowed.
+Private-server rejoin is optional and closes/relaunches Roblox using your locally
+configured server link. Turning the script's automatic rejoin off cancels its
+pending kick retry; the helper itself does not decide when to reconnect.
+Use "auto rejoin after a kick" in the helper window or tray menu to change the
+active script's setting. It stays in sync with the script, website and Discord.
+The switch is disabled when no supported script is active or local controls are
+off. It does not save or upload your private server link.
 
 source-code.txt contains the complete C# app/updater/installer, PowerShell backend,
 installer/build/publish tools, and public verification key. The private signing key

@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$Version = '1.2.0'
+$Version = '1.3.0'
 $Port = 47210
 $StallSec = 120
 $Workspace = 'C:\matcha\workspace'
@@ -587,6 +587,33 @@ function Handle-Client($client) {
           if($null -ne $j.afkMinutes){if($j.afkMinutes -lt 1 -or $j.afkMinutes -gt 120){throw 'AFK interval must be 1-120 minutes'};$cfg.afkMinutes=[double]$j.afkMinutes}
           if($j.script){$name=[string]$j.script;[void](Script-Dir $name);$f=Features $name (Script-State $name).state;foreach($p in $j.features.PSObject.Properties){if($p.Name -notin @('dashboard','webhook','watchdog','afk','files') -or $p.Value -isnot [bool]){throw 'invalid feature switch'};$f[$p.Name]=$p.Value};$cfg.scripts[$name]=$f}
           Write-Json $ConfigFile $cfg;Reply $stream 200 @{ok=$true};return
+        }
+        '/api/shot-upload' {
+          # A picture of the Roblox window, sent ONLY to the fixed dashboard origin with this
+          # installation's key (from the local script); never to a caller-chosen address.
+          if([string]$j.key -notmatch '^[a-f0-9]{64}$' -or [string]$j.name -notmatch '^[A-Za-z0-9_-]{1,64}$'){throw 'script name and dashboard key required'}
+          $img=Take-Shot 1280 $true
+          if(-not $img){Reply $stream 200 @{ok=$false;why=$script:ShotWhy};return}
+          $req=[Net.HttpWebRequest]::Create('https://adorablewhale.world/api/v1/shot?name='+[Uri]::EscapeDataString([string]$j.name))
+          $req.Method='POST';$req.ContentType='image/jpeg';$req.UserAgent='matcha-helper/'+$Version;$req.Timeout=15000;$req.AllowAutoRedirect=$false
+          $req.Headers['Authorization']='Bearer '+[string]$j.key;$req.ContentLength=$img.Length
+          $out=$req.GetRequestStream();$out.Write($img,0,$img.Length);$out.Close()
+          try{$resp=$req.GetResponse();$code=[int]$resp.StatusCode;$resp.Close()}catch [Net.WebException]{$code=if($_.Exception.Response){[int]$_.Exception.Response.StatusCode}else{0}}
+          Reply $stream 200 @{ok=($code -eq 200);status=$code;kb=[int]($img.Length/1024)};return
+        }
+        '/api/rejoin' {
+          # Relaunch Roblox into the user's private server after a kick. Only strict link codes are accepted.
+          $uri=$null
+          if([string]$j.linkCode -match '^[A-Za-z0-9_-]{8,80}$' -and [string]$j.placeId -match '^\d{1,20}$'){$uri='roblox://experiences/start?placeId='+$j.placeId+'&linkCode='+$j.linkCode}
+          elseif([string]$j.shareCode -match '^[A-Za-z0-9_-]{8,80}$'){$uri='roblox://navigation/share_links?code='+$j.shareCode+'&type=Server'}
+          elseif([string]$j.placeId -match '^\d{1,20}$'){$uri='roblox://experiences/start?placeId='+$j.placeId}   # no link: any public server
+          else{throw 'a place id or private server link code is required'}
+          # close the kicked client first so the relaunch starts clean
+          Get-Process RobloxPlayerBeta -ErrorAction SilentlyContinue|ForEach-Object{try{[void]$_.CloseMainWindow();if(-not $_.WaitForExit(4000)){$_.Kill()}}catch{}}
+          Start-Sleep -Milliseconds 1500
+          Start-Process -FilePath $uri
+          Say 'rejoining the private server' 'Cyan'
+          Reply $stream 200 @{ok=$true};return
         }
         '/api/http' {Reply $stream 200 (Proxy-Http $j);return}
         '/api/open' {$u=$null;if(-not [Uri]::TryCreate([string]$j.url,[UriKind]::Absolute,[ref]$u) -or $u.Scheme -notin @('http','https') -or $u.UserInfo){throw 'http/https URL required'};Start-Process -FilePath $u.AbsoluteUri;Reply $stream 200 @{ok=$true};return}

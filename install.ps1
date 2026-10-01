@@ -1,4 +1,4 @@
-# Matcha helper 1.2.0 per-user installer. Readable; no elevation or network downloads.
+# Matcha helper 1.3.0 per-user installer. Readable; no elevation or network downloads.
 [CmdletBinding()]
 param([switch]$Uninstall, [string]$Workspace, [int]$WaitPid = 0, [switch]$Tray, [switch]$Update, [switch]$NoStartup, [switch]$NoLaunch)
 $ErrorActionPreference = 'Stop'
