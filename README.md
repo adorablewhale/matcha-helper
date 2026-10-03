@@ -37,4 +37,13 @@ signed release publishing is a separate owner operation described in [README.txt
 `prepare-backend.py` is the historical bat-to-backend migration utility; it predates the current
 rejoin/screenshot backend. build from the checked-in `backend.ps1` and do not regenerate it with that utility.
 
+### something broke?
+
+message me on [discord](https://discord.com/users/599705734002769920), it works way better than issues here. tell me what you were doing and what happened.
+
 <sub>part of [insui](https://github.com/adorablewhale/insui) · dashboard at [adorablewhale.world](https://adorablewhale.world)</sub>
+
+---
+
+<div align="center"><sub>🐳 <b>adorablewhale</b> · <a href="https://adorablewhale.world/me">website</a> · <a href="https://discord.com/users/599705734002769920">discord</a> · <a href="https://github.com/adorablewhale">other projects</a></sub></div>
+
